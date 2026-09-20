@@ -1,73 +1,95 @@
 # -*- coding: utf-8 -*-
 """
-Aplicativo de coleta para a pesquisa sobre identificação de deepfakes.
+Data-collection app for the deepfake-detection study.
 
-Fluxo:
-  intro -> TCLE -> [ATRIBUIÇÃO DE GRUPO] -> sociodemográfico
-        -> (G1/G2) material educativo -> (G1/G2) verificação de aprendizagem
-        -> tarefa de classificação (12 imagens) -> questionários finais -> fim
+Groups (balanced in real time):
+  - "Controle"  (group 1): no training. Watches the videos and classifies them.
+  - "Checklist" (group 2): checklist training + learning check, then classifies.
+  - "XAI"       (group 3): classifies videos shown together with the model's
+                           deepfake probability and an XAI/LLM explanation.
 
-Atribuição balanceada em tempo real:
-  Cada novo participante que consente é alocado ao grupo que está mais "atrasado"
-  em relação à sua proporção-alvo (PESOS). Com pesos iguais (1:1:1) isso mantém as
-  três amostras do mesmo tamanho ao longo de toda a coleta ("minimização").
-  A decisão ler-contar-incrementar é serializada por um Lock de processo, o que
-  elimina condições de corrida no Streamlit Community Cloud (instância única).
+Flow:
+  intro -> consent (TCLE) -> [GROUP ASSIGNMENT] -> demographics
+        -> (Checklist) training -> (Checklist) learning check
+        -> classification task (videos from Google Drive) -> final questionnaires -> end
 
-Armazenamento:
-  - Google Sheets (durável) se houver credenciais em st.secrets  -> use para coleta real.
-  - SQLite local (efêmero) como fallback                          -> apenas para testes.
+Assignment: each consenting participant goes to the group furthest below its target
+proportion (WEIGHTS); equal weights (1:1:1) keep the three samples the same size.
+The read-choose-increment step is serialized by a process-wide lock (race-free on
+Streamlit Community Cloud's single instance).
+
+Storage & media:
+  - Responses + running counts -> Google Sheets (durable).
+  - Video stimuli              -> Google Drive folder, fetched via the service account.
+  - Stimulus metadata (which video, model probability, XAI explanation, ground-truth
+    label) -> a "stimuli" tab in the same spreadsheet, filled in by the researcher.
+  Without credentials the app falls back to local SQLite + placeholder stimuli
+  (testing only; Community Cloud wipes local files).
+
+NOTE: participant-facing text is Portuguese on purpose; the code is English.
 """
 
+import io
 import json
+import os
 import random
 import sqlite3
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import streamlit as st
 
 # =============================================================================
-# CONFIGURAÇÃO
+# CONFIGURATION
 # =============================================================================
 
-GRUPOS = ["Controle", "G1", "G2"]
+# Internal group codes (also stored in the Sheet). See module docstring.
+GROUPS = ["Controle", "Checklist", "XAI"]
 
-# Proporção-alvo entre os grupos. Iguais (1:1:1) => amostras do mesmo tamanho.
-# Para dar "necessidade proporcional" diferente a algum grupo, altere aqui
-# (ex.: {"Controle": 1, "G1": 1, "G2": 2} atribui o dobro ao G2).
-PESOS = {"Controle": 1, "G1": 1, "G2": 1}
+# Target proportion between groups. Equal (1:1:1) => same-size samples.
+WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}
 
-# Grupos que recebem material educativo + verificação (Seção 2 do formulário).
-GRUPOS_COM_MATERIAL = {"G1", "G2"}
-# Grupos que veem explicações da IA durante a tarefa de classificação.
-GRUPOS_COM_EXPLICACAO_IA = {"G2"}
+# Only the Checklist group gets the training material + learning check.
+GROUPS_WITH_MATERIAL = {"Checklist"}
+# Only the XAI group sees the model probability + explanation during the task.
+GROUPS_WITH_AI_EXPLANATION = {"XAI"}
 
-N_IMAGENS = 12  # tarefa de classificação (imagens não estão no MD -> placeholder)
+# Classification options shown for each video.
+LABEL_AUTENTICO = "Autêntico"
+LABEL_DEEPFAKE = "Gerado por IA"
+TASK_OPTIONS = [LABEL_AUTENTICO, LABEL_DEEPFAKE]
 
-# Colunas gravadas por participante.
-RESP_HEADERS = [
-    "timestamp", "participante_id", "grupo", "consentiu",
-    "faixa_etaria", "genero", "escolaridade",
-    "familiaridade_ia", "conhecimento_deepfake", "freq_redes", "usou_ia",
-    "verif_2_1", "verif_2_2", "verif_2_3", "verif_score",
-    "tarefa_json", "final_json", "completo",
+# Columns stored per participant (English schema).
+RESPONSE_HEADERS = [
+    "timestamp", "participant_id", "group", "consented",
+    "age_range", "gender", "education",
+    "ai_familiarity", "deepfake_knowledge", "social_media_freq", "used_ai",
+    "check_2_1", "check_2_2", "check_2_3", "check_score",
+    "task_json", "task_score", "final_json", "complete",
 ]
 
-# Gabarito da Seção 2 (NÃO exibido ao participante).
-GAB_2_1 = "Transições ou bordas não naturais entre o rosto e o fundo"
-GAB_2_2 = "Falso"
-GAB_2_3 = "Verificar a fonte e o contexto da mídia"
+# Columns of the "stimuli" tab (researcher-filled).
+#   order         : display order (number)
+#   video         : file NAME in the Drive folder (or a Drive file id)
+#   label         : ground truth: "real" / "deepfake" (optional; enables task_score)
+#   prob_deepfake : model probability, e.g. 0.87 or 87% (shown to XAI group)
+#   explanation   : XAI/LLM text explaining why it is real/deepfake (shown to XAI group)
+STIMULI_HEADERS = ["order", "video", "label", "prob_deepfake", "explanation"]
 
-OPCOES_2_1 = [
+# Section 2 answer key (NOT shown to the participant).
+ANSWER_2_1 = "Transições ou bordas não naturais entre o rosto e o fundo"
+ANSWER_2_2 = "Falso"
+ANSWER_2_3 = "Verificar a fonte e o contexto da mídia"
+
+OPTIONS_2_1 = [
     "Transições ou bordas não naturais entre o rosto e o fundo",
     "A imagem estar em alta resolução",
     "A pessoa estar sorrindo",
     "O arquivo ser grande",
 ]
-OPCOES_2_3 = [
+OPTIONS_2_3 = [
     "Verificar a fonte e o contexto da mídia",
     "Confiar apenas no número de curtidas",
     "Aumentar o brilho da tela",
@@ -75,9 +97,9 @@ OPCOES_2_3 = [
 ]
 
 # -----------------------------------------------------------------------------
-# TCLE — preencha os campos entre colchetes antes de coletar dados.
+# Consent text (Portuguese). Fill in the bracketed fields before collecting data.
 # -----------------------------------------------------------------------------
-TCLE_TEXTO = """
+CONSENT_TEXT = """
 **TERMO DE CONSENTIMENTO LIVRE E ESCLARECIDO**
 
 Você está sendo convidado(a) a participar da pesquisa **“[TÍTULO DO PROJETO]”**,
@@ -85,13 +107,14 @@ conduzida por **[NOME DO PESQUISADOR]**, vinculada à **[INSTITUIÇÃO / PROGRAM
 sob orientação de **[NOME DO ORIENTADOR]**.
 
 - **Objetivo:** avaliar como orientações de letramento digital e explicações de
-  inteligência artificial ajudam pessoas a identificar imagens faciais autênticas
-  ou manipuladas (*deepfakes*).
+  inteligência artificial ajudam pessoas a identificar vídeos faciais autênticos
+  ou manipulados (*deepfakes*).
 - **Procedimentos:** você responderá a um questionário inicial, poderá receber um
-  breve material educativo, classificará 12 imagens como autênticas ou geradas por
-  IA e responderá a questionários finais. Duração estimada: **cerca de [X] minutos**.
-- **Riscos:** mínimos, limitados a eventual desconforto ou cansaço ao analisar as
-  imagens. Você pode interromper a participação a qualquer momento.
+  breve material educativo, assistirá a alguns vídeos e os classificará como
+  autênticos ou gerados por IA, e responderá a questionários finais. Duração
+  estimada: **cerca de [X] minutos**.
+- **Riscos:** mínimos, limitados a eventual desconforto ou cansaço ao analisar os
+  vídeos. Você pode interromper a participação a qualquer momento.
 - **Benefícios:** contribuir para o desenvolvimento de ferramentas de combate à
   desinformação e ampliar sua percepção sobre mídias manipuladas.
 - **Voluntariedade:** a participação é **voluntária e não remunerada**. Você pode
@@ -104,31 +127,33 @@ sob orientação de **[NOME DO ORIENTADOR]**.
 """
 
 # =============================================================================
-# INFRAESTRUTURA (lock + armazenamento)
+# INFRASTRUCTURE (lock + assignment)
 # =============================================================================
 
 
 @st.cache_resource
 def get_lock() -> threading.Lock:
-    """Lock único e compartilhado por todas as sessões da instância."""
+    """Single lock shared across every session in this instance."""
     return threading.Lock()
 
 
-def escolher_grupo(counts: dict) -> str:
-    """Grupo que minimiza (n+1)/peso; empate resolvido aleatoriamente."""
-    melhor_val = None
-    candidatos = []
-    for g in GRUPOS:
-        val = (counts.get(g, 0) + 1) / PESOS[g]
-        if melhor_val is None or val < melhor_val - 1e-9:
-            melhor_val = val
-            candidatos = [g]
-        elif abs(val - melhor_val) <= 1e-9:
-            candidatos.append(g)
-    return random.choice(candidatos)
+def choose_group(counts: dict) -> str:
+    """Return the group that minimizes (n+1)/weight; ties broken at random."""
+    best_val = None
+    candidates = []
+    for g in GROUPS:
+        val = (counts.get(g, 0) + 1) / WEIGHTS[g]
+        if best_val is None or val < best_val - 1e-9:
+            best_val = val
+            candidates = [g]
+        elif abs(val - best_val) <= 1e-9:
+            candidates.append(g)
+    return random.choice(candidates)
 
 
-# ----- Backend: Google Sheets ------------------------------------------------
+# =============================================================================
+# STORAGE BACKENDS
+# =============================================================================
 
 class SheetsStorage:
     def __init__(self):
@@ -140,9 +165,9 @@ class SheetsStorage:
         creds = Credentials.from_service_account_info(info, scopes=scopes)
         self._gspread = gspread
         self.client = gspread.authorize(creds)
-        self.sh = self.client.open_by_key(st.secrets["planilha"]["spreadsheet_key"])
-        self.resp = self._ws("respostas", RESP_HEADERS)
-        self.cont = self._ws("contagem", ["grupo", "n"])
+        self.sh = self.client.open_by_key(st.secrets["spreadsheet"]["spreadsheet_key"])
+        self.responses_ws = self._ws("responses", RESPONSE_HEADERS)
+        self.counts_ws = self._ws("counts", ["group", "n"])
         self._ensure_counts()
 
     def _ws(self, name, headers):
@@ -155,306 +180,445 @@ class SheetsStorage:
         return ws
 
     def _ensure_counts(self):
-        existentes = {r["grupo"] for r in self.cont.get_all_records()}
-        for g in GRUPOS:
-            if g not in existentes:
-                self.cont.append_row([g, 0])
+        existing = {r["group"] for r in self.counts_ws.get_all_records()}
+        for g in GROUPS:
+            if g not in existing:
+                self.counts_ws.append_row([g, 0])
 
     def counts(self) -> dict:
-        return {r["grupo"]: int(r["n"]) for r in self.cont.get_all_records()}
+        return {r["group"]: int(r["n"]) for r in self.counts_ws.get_all_records()}
 
-    def _set_count(self, grupo, n):
-        for i, r in enumerate(self.cont.get_all_records(), start=2):  # linha 1 = cabeçalho
-            if r["grupo"] == grupo:
-                self.cont.update_cell(i, 2, n)
+    def _set_count(self, group, n):
+        for i, r in enumerate(self.counts_ws.get_all_records(), start=2):  # row 1 = header
+            if r["group"] == group:
+                self.counts_ws.update_cell(i, 2, n)
                 return
 
     def assign_group(self) -> str:
         with get_lock():
             counts = self.counts()
-            grupo = escolher_grupo(counts)
-            self._set_count(grupo, counts.get(grupo, 0) + 1)
-            return grupo
+            group = choose_group(counts)
+            self._set_count(group, counts.get(group, 0) + 1)
+            return group
+
+    def get_stimuli(self) -> list:
+        ws = self._ws("stimuli", STIMULI_HEADERS)
+        rows = ws.get_all_records()
+
+        def _key(r):
+            try:
+                return float(r.get("order", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        return sorted(rows, key=_key)
 
     def save_response(self, row: dict):
-        self.resp.append_row(
-            [str(row.get(h, "")) for h in RESP_HEADERS],
+        self.responses_ws.append_row(
+            [str(row.get(h, "")) for h in RESPONSE_HEADERS],
             value_input_option="RAW",
         )
 
 
-# ----- Backend: SQLite (fallback local, efêmero) -----------------------------
-
 class SQLiteStorage:
-    def __init__(self, path="respostas.db"):
+    """Local fallback for testing only (Community Cloud wipes local files)."""
+
+    def __init__(self, path="responses.db"):
         self.conn = sqlite3.connect(path, check_same_thread=False)
         c = self.conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS contagem (grupo TEXT PRIMARY KEY, n INTEGER)")
-        for g in GRUPOS:
-            c.execute("INSERT OR IGNORE INTO contagem (grupo, n) VALUES (?, 0)", (g,))
-        cols = ", ".join(f'"{h}" TEXT' for h in RESP_HEADERS)
-        c.execute(f"CREATE TABLE IF NOT EXISTS respostas ({cols})")
+        c.execute("CREATE TABLE IF NOT EXISTS counts (grp TEXT PRIMARY KEY, n INTEGER)")
+        for g in GROUPS:
+            c.execute("INSERT OR IGNORE INTO counts (grp, n) VALUES (?, 0)", (g,))
+        cols = ", ".join(f'"{h}" TEXT' for h in RESPONSE_HEADERS)
+        c.execute(f"CREATE TABLE IF NOT EXISTS responses ({cols})")
         self.conn.commit()
 
     def counts(self) -> dict:
-        cur = self.conn.execute("SELECT grupo, n FROM contagem")
-        return {g: n for g, n in cur.fetchall()}
+        return {g: n for g, n in self.conn.execute("SELECT grp, n FROM counts")}
 
     def assign_group(self) -> str:
         with get_lock():
             counts = self.counts()
-            grupo = escolher_grupo(counts)
-            self.conn.execute("UPDATE contagem SET n = n + 1 WHERE grupo = ?", (grupo,))
+            group = choose_group(counts)
+            self.conn.execute("UPDATE counts SET n = n + 1 WHERE grp = ?", (group,))
             self.conn.commit()
-            return grupo
+            return group
+
+    def get_stimuli(self) -> list:
+        return []  # no stimuli sheet locally; placeholders are used instead
 
     def save_response(self, row: dict):
-        ph = ", ".join("?" * len(RESP_HEADERS))
+        ph = ", ".join("?" * len(RESPONSE_HEADERS))
         self.conn.execute(
-            f"INSERT INTO respostas VALUES ({ph})",
-            [str(row.get(h, "")) for h in RESP_HEADERS],
+            f"INSERT INTO responses VALUES ({ph})",
+            [str(row.get(h, "")) for h in RESPONSE_HEADERS],
         )
         self.conn.commit()
 
 
-def _tem_sheets() -> bool:
+def _has_sheets() -> bool:
     try:
-        return "gcp_service_account" in st.secrets and "planilha" in st.secrets
+        return "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets
     except Exception:
         return False
 
 
 @st.cache_resource
 def get_storage():
-    if _tem_sheets():
+    if _has_sheets():
         return SheetsStorage(), "sheets"
     return SQLiteStorage(), "sqlite"
 
 
 # =============================================================================
-# ESTADO E NAVEGAÇÃO
+# GOOGLE DRIVE (video stimuli)
+# =============================================================================
+
+@st.cache_resource
+def _drive_service():
+    from googleapiclient.discovery import build
+    from google.oauth2.service_account import Credentials
+
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]), scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def drive_name_map() -> dict:
+    """Map {filename: file_id} for the configured Drive folder (refreshes every 5 min)."""
+    try:
+        folder_id = st.secrets["drive"]["folder_id"]
+    except Exception:
+        return {}
+    service = _drive_service()
+    files, page_token = {}, None
+    while True:
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields="nextPageToken, files(id, name)",
+            pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            files[f["name"]] = f["id"]
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+@st.cache_resource(show_spinner=False)
+def get_video_path(file_id: str) -> str:
+    """Download a Drive video once to a local temp file; return its path."""
+    from googleapiclient.http import MediaIoBaseDownload
+
+    path = os.path.join(tempfile.gettempdir(), f"stimulus_{file_id}.mp4")
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        service = _drive_service()
+        request = service.files().get_media(fileId=file_id)
+        fh = io.FileIO(path, "wb")
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        fh.close()
+    return path
+
+
+def safe_video_path(file_id: str):
+    try:
+        return get_video_path(file_id)
+    except Exception:
+        return None
+
+
+def fmt_prob(value) -> str:
+    """Format a probability (0.87, '0,87', '87%', 87) as a percentage string."""
+    try:
+        v = float(str(value).replace("%", "").replace(",", ".").strip())
+        if v > 1:
+            v /= 100.0
+        return f"{v * 100:.0f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def label_matches(ground_truth: str, answer: str) -> bool:
+    gt = str(ground_truth).strip().lower()
+    if gt in {"real", "autentico", "autêntico", "authentic", "genuino", "genuíno"}:
+        return answer == LABEL_AUTENTICO
+    if gt in {"deepfake", "fake", "ia", "gerado por ia", "manipulado", "falso"}:
+        return answer == LABEL_DEEPFAKE
+    return False
+
+
+def load_stimuli():
+    """Return (list_of_stimulus_dicts, mode). In test mode, returns placeholders."""
+    storage, mode = get_storage()
+    if mode == "sheets":
+        try:
+            return storage.get_stimuli(), "sheets"
+        except Exception:
+            return [], "sheets"
+    dummies = [
+        {"order": i, "video": "", "label": "",
+         "prob_deepfake": "0.5",
+         "explanation": f"〔explicação XAI de exemplo para o vídeo {i}〕"}
+        for i in range(1, 4)
+    ]
+    return dummies, "test"
+
+
+# =============================================================================
+# STATE AND NAVIGATION
 # =============================================================================
 
 def init_state():
     ss = st.session_state
     ss.setdefault("step", "intro")
     ss.setdefault("pid", str(uuid.uuid4()))
-    ss.setdefault("grupo", None)
-    ss.setdefault("dados", {})
-    ss.setdefault("enviado", False)
+    ss.setdefault("group", None)
+    ss.setdefault("data", {})
+    ss.setdefault("saved", False)
 
 
-def ir_para(step):
+def go_to(step):
     st.session_state.step = step
     st.rerun()
 
 
-def proximo_apos_socio():
-    return "material" if st.session_state.grupo in GRUPOS_COM_MATERIAL else "tarefa"
+def next_after_demographics():
+    return "material" if st.session_state.group in GROUPS_WITH_MATERIAL else "task"
 
 
 # =============================================================================
-# TELAS
+# SCREENS  (headings, questions and buttons are Portuguese on purpose)
 # =============================================================================
 
-def tela_intro(modo):
-    st.title("Pesquisa: identificação de imagens autênticas e deepfakes")
+def screen_intro(mode):
+    st.title("Pesquisa: identificação de vídeos autênticos e deepfakes")
     st.write(
         "Obrigado pelo seu interesse. Nesta pesquisa você responderá a algumas "
-        "perguntas e analisará imagens de rostos, indicando se são autênticas ou "
-        "geradas por inteligência artificial. A participação é anônima e leva "
+        "perguntas e assistirá a vídeos de rostos, indicando se são autênticos ou "
+        "gerados por inteligência artificial. A participação é anônima e leva "
         "cerca de **[X] minutos**."
     )
-    if modo == "sqlite":
+    if mode == "sqlite":
         st.warning(
-            "⚠️ **Modo de teste local (SQLite).** Configure o Google Sheets antes de "
-            "coletar dados reais — no Streamlit Community Cloud o armazenamento local "
-            "é apagado a cada reinício do app."
+            "⚠️ **Modo de teste local (SQLite).** Configure o Google Sheets e o Google "
+            "Drive antes de coletar dados reais — no Streamlit Community Cloud o "
+            "armazenamento local é apagado a cada reinício do app."
         )
     if st.button("Começar", type="primary"):
-        ir_para("tcle")
+        go_to("consent")
 
 
-def tela_tcle():
+def screen_consent():
     st.header("Termo de Consentimento Livre e Esclarecido (TCLE)")
     st.info(
         "Pesquisa com seres humanos no Brasil normalmente exige aprovação de um "
         "Comitê de Ética (CEP) via Plataforma Brasil. Insira CAAE/parecer e contatos "
         "no texto abaixo antes de coletar dados."
     )
-    st.markdown(TCLE_TEXTO)
+    st.markdown(CONSENT_TEXT)
 
-    escolha = st.radio(
+    choice = st.radio(
         "Declaro que li e compreendi o TCLE acima e concordo em participar da pesquisa. *",
         ["Sim, li, compreendi e concordo em participar.", "Não desejo participar."],
         index=None,
     )
     if st.button("Continuar", type="primary"):
-        if escolha is None:
+        if choice is None:
             st.error("Selecione uma opção para continuar.")
-        elif escolha.startswith("Não"):
-            ir_para("recusou")
+        elif choice.startswith("Não"):
+            go_to("declined")
         else:
-            # ---- ATRIBUIÇÃO BALANCEADA (ocorre uma única vez por sessão) ----
-            if st.session_state.grupo is None:
+            if st.session_state.group is None:  # assign exactly once per session
                 storage, _ = get_storage()
-                st.session_state.grupo = storage.assign_group()
-            st.session_state.dados["consentiu"] = "Sim"
-            ir_para("socio")
+                st.session_state.group = storage.assign_group()
+            st.session_state.data["consented"] = "Sim"
+            go_to("demographics")
 
 
-def tela_recusou():
+def screen_declined():
     st.header("Participação não iniciada")
     st.write("Tudo bem. Obrigado pelo seu tempo — você pode fechar esta janela.")
 
 
-def tela_socio():
+def screen_demographics():
     st.header("Seção 1 — Questionário sociodemográfico")
     st.caption("Campos com * são obrigatórios.")
-    with st.form("socio"):
-        faixa = st.radio("1.1 Qual é a sua faixa etária? *",
-                         ["18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
-        genero = st.radio("1.2 Com qual gênero você se identifica?",
+    with st.form("demographics"):
+        age = st.radio("1.1 Qual é a sua faixa etária? *",
+                       ["18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
+        gender = st.radio("1.2 Com qual gênero você se identifica?",
                           ["Feminino", "Masculino", "Outro", "Prefiro não responder"], index=None)
-        escol = st.radio("1.3 Nível de escolaridade mais alto já concluído? *",
-                         ["Ensino fundamental", "Ensino médio",
-                          "Ensino superior (graduação)", "Pós-graduação"], index=None)
-        fam = st.radio("1.4 Familiaridade com Inteligência Artificial? *  (1 = Nenhuma … 5 = Especialista)",
-                       [1, 2, 3, 4, 5], index=None, horizontal=True)
-        conhec = st.radio("1.5 Conhecimento prévio sobre *deepfakes*? *",
-                          ["Nenhum", "Algum", "Bastante"], index=None)
-        freq = st.radio("1.6 Com que frequência você usa redes sociais?",
-                        ["Raramente", "Semanalmente", "Diariamente", "Várias vezes ao dia"], index=None)
-        usou = st.radio("1.7 Você já usou alguma ferramenta baseada em IA?",
-                        ["Sim", "Não"], index=None)
-        enviar = st.form_submit_button("Continuar", type="primary")
+        education = st.radio("1.3 Nível de escolaridade mais alto já concluído? *",
+                             ["Ensino fundamental", "Ensino médio",
+                              "Ensino superior (graduação)", "Pós-graduação"], index=None)
+        ai_familiarity = st.radio(
+            "1.4 Familiaridade com Inteligência Artificial? *  (1 = Nenhuma … 5 = Especialista)",
+            [1, 2, 3, 4, 5], index=None, horizontal=True)
+        deepfake_knowledge = st.radio("1.5 Conhecimento prévio sobre *deepfakes*? *",
+                                      ["Nenhum", "Algum", "Bastante"], index=None)
+        social_media_freq = st.radio("1.6 Com que frequência você usa redes sociais?",
+                                     ["Raramente", "Semanalmente", "Diariamente", "Várias vezes ao dia"],
+                                     index=None)
+        used_ai = st.radio("1.7 Você já usou alguma ferramenta baseada em IA?",
+                           ["Sim", "Não"], index=None)
+        submit = st.form_submit_button("Continuar", type="primary")
 
-    if enviar:
-        faltando = [q for q, v in [("1.1", faixa), ("1.3", escol), ("1.4", fam), ("1.5", conhec)] if v is None]
-        if faltando:
-            st.error("Responda às perguntas obrigatórias: " + ", ".join(faltando))
+    if submit:
+        missing = [q for q, v in [("1.1", age), ("1.3", education),
+                                  ("1.4", ai_familiarity), ("1.5", deepfake_knowledge)] if v is None]
+        if missing:
+            st.error("Responda às perguntas obrigatórias: " + ", ".join(missing))
         else:
-            st.session_state.dados.update({
-                "faixa_etaria": faixa, "genero": genero, "escolaridade": escol,
-                "familiaridade_ia": fam, "conhecimento_deepfake": conhec,
-                "freq_redes": freq, "usou_ia": usou,
+            st.session_state.data.update({
+                "age_range": age, "gender": gender, "education": education,
+                "ai_familiarity": ai_familiarity, "deepfake_knowledge": deepfake_knowledge,
+                "social_media_freq": social_media_freq, "used_ai": used_ai,
             })
-            ir_para(proximo_apos_socio())
+            go_to(next_after_demographics())
 
 
-def tela_material():
-    st.header("Material educativo — letramento digital")
-    # TODO: inserir aqui o conteúdo real do módulo educativo (texto/vídeo/imagens).
-    st.write(
-        "Leia com atenção antes de prosseguir. Alguns sinais de que uma imagem pode "
-        "ter sido manipulada por IA:"
-    )
+def screen_material():
+    st.header("Treinamento — checklist para identificar deepfakes")
+    # TODO: replace with the real checklist training for group "Checklist".
+    st.write("Antes de classificar os vídeos, revise este checklist de verificação:")
     st.markdown(
-        "- Transições ou bordas não naturais entre o rosto e o fundo\n"
-        "- Assimetrias em olhos, dentes, orelhas ou acessórios\n"
-        "- Texturas de pele/cabelo artificiais e iluminação inconsistente\n\n"
-        "A inspeção visual **não** é suficiente sozinha: verifique também a **fonte** e "
-        "o **contexto** da mídia."
+        "1. **Bordas e transições** — o rosto se mistura de forma natural ao fundo, ao "
+        "cabelo e ao pescoço?\n"
+        "2. **Olhos e piscadas** — o olhar e a frequência de piscadas parecem naturais?\n"
+        "3. **Boca e fala** — os lábios acompanham o áudio? Há dentes/língua estranhos?\n"
+        "4. **Iluminação e sombras** — a luz no rosto é coerente com o ambiente?\n"
+        "5. **Textura de pele/cabelo** — há áreas borradas, cerosas ou artificiais?\n"
+        "6. **Fonte e contexto** — de onde vem o vídeo? A situação faz sentido?\n\n"
+        "A inspeção visual **não** basta sozinha: sempre considere a **fonte** e o "
+        "**contexto** da mídia."
     )
-    st.caption("〔Placeholder — substitua pelo material definitivo da sua pesquisa.〕")
-    if st.button("Li o material e desejo continuar", type="primary"):
-        ir_para("verificacao")
+    st.caption("〔Placeholder — substitua pelo material de treinamento definitivo.〕")
+    if st.button("Concluí o treinamento e desejo continuar", type="primary"):
+        go_to("check")
 
 
-def tela_verificacao():
+def screen_check():
     st.header("Seção 2 — Verificação de aprendizagem")
-    with st.form("verif"):
-        q1 = st.radio("2.1 Qual é um sinal comum de que uma imagem pode ter sido manipulada por IA? *",
-                      OPCOES_2_1, index=None)
-        q2 = st.radio("2.2 A inspeção visual, sozinha, é suficiente para garantir que uma imagem é autêntica. *",
+    with st.form("check"):
+        q1 = st.radio("2.1 Qual é um sinal comum de que um vídeo pode ter sido manipulado por IA? *",
+                      OPTIONS_2_1, index=None)
+        q2 = st.radio("2.2 A inspeção visual, sozinha, é suficiente para garantir que um vídeo é autêntico. *",
                       ["Verdadeiro", "Falso"], index=None)
-        q3 = st.radio("2.3 Ao avaliar uma possível *deepfake*, além de observar a imagem, também é importante: *",
-                      OPCOES_2_3, index=None)
-        enviar = st.form_submit_button("Continuar", type="primary")
+        q3 = st.radio("2.3 Ao avaliar um possível *deepfake*, além de observar o vídeo, também é importante: *",
+                      OPTIONS_2_3, index=None)
+        submit = st.form_submit_button("Continuar", type="primary")
 
-    if enviar:
+    if submit:
         if None in (q1, q2, q3):
             st.error("Responda a todas as perguntas para continuar.")
         else:
-            score = int(q1 == GAB_2_1) + int(q2 == GAB_2_2) + int(q3 == GAB_2_3)
-            st.session_state.dados.update({
-                "verif_2_1": q1, "verif_2_2": q2, "verif_2_3": q3, "verif_score": score,
+            score = int(q1 == ANSWER_2_1) + int(q2 == ANSWER_2_2) + int(q3 == ANSWER_2_3)
+            st.session_state.data.update({
+                "check_2_1": q1, "check_2_2": q2, "check_2_3": q3, "check_score": score,
             })
-            ir_para("tarefa")
+            go_to("task")
 
 
-def tela_tarefa():
-    grupo = st.session_state.grupo
-    st.header("Tarefa — classifique as imagens")
-    st.write("Para cada imagem, indique se você a considera **autêntica** ou **gerada por IA**.")
-    st.caption(
-        "〔Placeholder — coloque as 12 imagens em `imagens/1.jpg … 12.jpg`. "
-        "Substitua também a explicação da IA (mostrada apenas ao G2) pela real.〕"
-    )
+def screen_task():
+    group = st.session_state.group
+    show_ai = group in GROUPS_WITH_AI_EXPLANATION
 
-    with st.form("tarefa"):
-        respostas = {}
-        for i in range(1, N_IMAGENS + 1):
-            st.markdown(f"**Imagem {i}**")
-            caminho = Path(f"imagens/{i}.jpg")
-            if caminho.exists():
-                st.image(str(caminho), width=320)
+    st.header("Tarefa — assista e classifique os vídeos")
+    st.write("Para cada vídeo, indique se você o considera **autêntico** ou **gerado por IA**.")
+
+    stimuli, source = load_stimuli()
+    if not stimuli:
+        st.warning(
+            "Nenhum vídeo configurado. Preencha a aba **stimuli** da planilha "
+            "(colunas: order, video, label, prob_deepfake, explanation) e coloque os "
+            "arquivos na pasta do Google Drive."
+        )
+        return
+    if source == "test":
+        st.caption("〔Modo de teste: vídeos indisponíveis; exibindo apenas a estrutura.〕")
+
+    name_map = drive_name_map()
+
+    with st.form("task"):
+        answers, labels = {}, {}
+        for idx, s in enumerate(stimuli, start=1):
+            st.markdown(f"**Vídeo {idx}**")
+
+            video_value = str(s.get("video", "")).strip()
+            file_id = name_map.get(video_value, video_value)  # filename -> id, else assume id
+            path = safe_video_path(file_id) if file_id else None
+            if path:
+                st.video(path)
             else:
                 st.markdown(
-                    "<div style='width:320px;height:180px;background:#eee;border-radius:8px;"
-                    "display:flex;align-items:center;justify-content:center;color:#888'>"
-                    f"imagem {i}</div>", unsafe_allow_html=True)
-            if grupo in GRUPOS_COM_EXPLICACAO_IA:
-                st.info("🤖 Explicação da IA: 〔texto/heatmap da análise automática desta imagem〕")
-            respostas[f"img_{i}"] = st.radio(
-                f"Classificação da imagem {i} *",
-                ["Autêntica", "Gerada por IA"], index=None, horizontal=True, key=f"img_{i}",
-                label_visibility="collapsed",
-            )
+                    "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
+                    "border-radius:8px;display:flex;align-items:center;justify-content:center;"
+                    f"color:#888'>vídeo {idx}</div>", unsafe_allow_html=True)
+
+            if show_ai:
+                st.info(f"🤖 Probabilidade estimada de ser deepfake (modelo): "
+                        f"**{fmt_prob(s.get('prob_deepfake'))}**")
+                explanation = str(s.get("explanation", "")).strip()
+                if explanation:
+                    st.markdown(f"**Explicação da IA:** {explanation}")
+
+            key = f"vid_{idx}"
+            answers[key] = st.radio(f"Classificação do vídeo {idx} *", TASK_OPTIONS,
+                                    index=None, horizontal=True, key=key,
+                                    label_visibility="collapsed")
+            labels[key] = str(s.get("label", "")).strip()
             st.divider()
-        enviar = st.form_submit_button("Continuar", type="primary")
+        submit = st.form_submit_button("Continuar", type="primary")
 
-    if enviar:
-        if any(v is None for v in respostas.values()):
-            st.error("Classifique todas as imagens antes de continuar.")
+    if submit:
+        if any(v is None for v in answers.values()):
+            st.error("Classifique todos os vídeos antes de continuar.")
         else:
-            st.session_state.dados["tarefa_json"] = json.dumps(respostas, ensure_ascii=False)
-            ir_para("final")
+            st.session_state.data["task_json"] = json.dumps(answers, ensure_ascii=False)
+            if all(labels.values()):  # score only if every stimulus has a ground-truth label
+                score = sum(label_matches(labels[k], answers[k]) for k in answers)
+                st.session_state.data["task_score"] = score
+            go_to("final")
 
 
-def tela_final():
+def screen_final():
     st.header("Questionários finais")
     st.caption("〔Placeholder — insira aqui os questionários finais da sua pesquisa.〕")
     with st.form("final"):
-        confianca = st.radio("Quão confiante você ficou nas suas classificações? (1 = Nada … 5 = Muito)",
-                             [1, 2, 3, 4, 5], index=None, horizontal=True)
-        dificuldade = st.radio("Quão difícil foi a tarefa? (1 = Muito fácil … 5 = Muito difícil)",
-                               [1, 2, 3, 4, 5], index=None, horizontal=True)
-        comentarios = st.text_area("Comentários (opcional)")
-        enviar = st.form_submit_button("Enviar respostas", type="primary")
+        confidence = st.radio("Quão confiante você ficou nas suas classificações? (1 = Nada … 5 = Muito)",
+                              [1, 2, 3, 4, 5], index=None, horizontal=True)
+        difficulty = st.radio("Quão difícil foi a tarefa? (1 = Muito fácil … 5 = Muito difícil)",
+                              [1, 2, 3, 4, 5], index=None, horizontal=True)
+        comments = st.text_area("Comentários (opcional)")
+        submit = st.form_submit_button("Enviar respostas", type="primary")
 
-    if enviar:
-        st.session_state.dados["final_json"] = json.dumps(
-            {"confianca": confianca, "dificuldade": dificuldade, "comentarios": comentarios},
+    if submit:
+        st.session_state.data["final_json"] = json.dumps(
+            {"confidence": confidence, "difficulty": difficulty, "comments": comments},
             ensure_ascii=False,
         )
-        ir_para("fim")
+        go_to("end")
 
 
-def tela_fim():
+def screen_end():
     ss = st.session_state
-    if not ss.enviado:
+    if not ss.saved:
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "participante_id": ss.pid,
-            "grupo": ss.grupo,
-            "completo": "Sim",
-            **ss.dados,
+            "participant_id": ss.pid,
+            "group": ss.group,
+            "complete": "Sim",
+            **ss.data,
         }
         try:
             storage, _ = get_storage()
             storage.save_response(row)
-            ss.enviado = True
+            ss.saved = True
         except Exception as e:  # noqa: BLE001
             st.error("Não foi possível salvar suas respostas. Tente novamente em instantes.")
             st.caption(f"Detalhe técnico: {e}")
@@ -463,67 +627,78 @@ def tela_fim():
             return
 
     st.header("Obrigado por participar! ✅")
-    st.write("Suas respostas foram registradas de forma anônima. Você pode fechar esta janela.")
+    st.write("Suas respostas foram registradas de forma anônima.")
+    st.success(f"Você participou do grupo: **{ss.group}**")
+    st.caption("Anote esta informação caso precise informá-la à equipe da pesquisa.")
+    st.write("Você pode fechar esta janela.")
 
 
-def tela_admin():
-    st.header("Painel do pesquisador")
+def screen_admin():
+    st.header("Researcher panel")
     try:
-        storage, modo = get_storage()
+        storage, mode = get_storage()
         counts = storage.counts()
     except Exception as e:  # noqa: BLE001
-        st.error(f"Erro ao ler contagens: {e}")
+        st.error(f"Failed to read counts: {e}")
         return
-    total = sum(counts.values())
-    st.metric("Total atribuído", total)
-    st.write({g: counts.get(g, 0) for g in GRUPOS})
-    st.caption(f"Backend: {modo} · pesos-alvo: {PESOS}")
+    st.metric("Total assigned", sum(counts.values()))
+    st.write({g: counts.get(g, 0) for g in GROUPS})
+    st.caption(f"Backend: {mode} · target weights: {WEIGHTS}")
+
+
+def render_admin_gate():
+    """Password-gated researcher panel. The password lives in secrets, never in the URL."""
+    ss = st.session_state
+    try:
+        expected = st.secrets.get("admin", {}).get("key")
+    except Exception:
+        expected = None
+    if not expected:
+        st.error("Painel indisponível: defina admin.key nos secrets.")
+        return
+    if not ss.get("admin_ok"):
+        st.header("Acesso restrito")
+        pwd = st.text_input("Senha do pesquisador", type="password")
+        if st.button("Entrar", type="primary"):
+            if pwd == expected:
+                ss.admin_ok = True
+                st.rerun()
+            else:
+                st.error("Senha incorreta.")
+        return
+    screen_admin()
 
 
 # =============================================================================
-# ROTEADOR
+# ROUTER
 # =============================================================================
 
 def main():
     st.set_page_config(page_title="Pesquisa deepfakes", page_icon="🔎")
     init_state()
-    _, modo = get_storage()
+    _, mode = get_storage()
 
-    # Painel do pesquisador: acesse com ?admin=SUA_CHAVE
-    admin_key = st.query_params.get("admin")
-    if admin_key is not None:
-        try:
-            esperado = st.secrets.get("admin", {}).get("key")
-        except Exception:
-            esperado = None
-        if esperado and admin_key == esperado:
-            tela_admin()
-        else:
-            st.error("Chave de administrador inválida.")
+    if "admin" in st.query_params:  # researcher panel: ?admin  (password asked on the page)
+        render_admin_gate()
         return
 
-    step = st.session_state.step
-    if step == "intro":
-        tela_intro(modo)
-    elif step == "tcle":
-        tela_tcle()
-    elif step == "recusou":
-        tela_recusou()
-    elif step == "socio":
-        tela_socio()
-    elif step == "material":
-        tela_material()
-    elif step == "verificacao":
-        tela_verificacao()
-    elif step == "tarefa":
-        tela_tarefa()
-    elif step == "final":
-        tela_final()
-    elif step == "fim":
-        tela_fim()
-    else:
+    screens = {
+        "intro": lambda: screen_intro(mode),
+        "consent": screen_consent,
+        "declined": screen_declined,
+        "demographics": screen_demographics,
+        "material": screen_material,
+        "check": screen_check,
+        "task": screen_task,
+        "final": screen_final,
+        "end": screen_end,
+    }
+    render = screens.get(st.session_state.step)
+    if render is None:
         st.session_state.step = "intro"
         st.rerun()
+    else:
+        render()
 
 
 if __name__ == "__main__":
