@@ -46,8 +46,8 @@ WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}  # 1:1:1 => same-size sample
 GROUPS_WITH_MATERIAL = {"Checklist"}
 GROUPS_WITH_AI_EXPLANATION = {"XAI"}
 
-LABEL_AUTENTICO = "Autêntico"
-LABEL_DEEPFAKE = "Gerado por IA"
+LABEL_AUTENTICO = "Legítimo"
+LABEL_DEEPFAKE = "Deepfake"
 TASK_OPTIONS = [LABEL_AUTENTICO, LABEL_DEEPFAKE]
 
 # Fields stored per participant. Note: "group" maps to DB column "grp".
@@ -92,7 +92,7 @@ sob orientação de Rogério Pozza e Robson Bonidia.
   ou manipulados (*deepfakes*).
 - **Procedimentos:** você responderá a um questionário inicial, poderá receber um
   breve material educativo, assistirá a alguns vídeos e os classificará como
-  autênticos ou gerados por IA, e responderá a questionários finais. Duração
+  legítimos ou deepfakes, e responderá a questionários finais. Duração
   estimada: **cerca de 15 minutos**.
 - **Riscos:** mínimos, limitados a eventual desconforto ou cansaço ao analisar os
   vídeos. Você pode interromper a participação a qualquer momento.
@@ -236,14 +236,23 @@ def video_url(video_value: str):
     return f"{base}/storage/v1/object/public/{bucket}/{v}"
 
 
-def fmt_prob(value) -> str:
+def parse_prob(value):
+    """Return the deepfake probability as a float in [0, 1], or None."""
     try:
         x = float(str(value).replace("%", "").replace(",", ".").strip())
-        if x > 1:
-            x /= 100.0
-        return f"{x * 100:.0f}%"
     except (TypeError, ValueError):
-        return str(value)
+        return None
+    return x / 100.0 if x > 1 else x
+
+
+def model_verdict(prob_deepfake_raw):
+    """Return (verdict, confidence_in_verdict) or None from a deepfake probability.
+    Verdict is 'Deepfake' when P(deepfake) >= 0.5, else 'Real'; confidence is the
+    probability of the chosen verdict."""
+    p = parse_prob(prob_deepfake_raw)
+    if p is None:
+        return None
+    return ("Deepfake", p) if p >= 0.5 else ("Real", 1 - p)
 
 
 def label_matches(ground_truth: str, answer: str) -> bool:
@@ -308,7 +317,7 @@ def screen_intro(mode):
     )
     if mode == "sqlite":
         st.warning(
-            "**Modo de teste local (SQLite).** Configure o Supabase antes de "
+            "⚠️ **Modo de teste local (SQLite).** Configure o Supabase antes de "
             "coletar dados reais."
         )
     if st.button("Começar", type="primary"):
@@ -317,11 +326,6 @@ def screen_intro(mode):
 
 def screen_consent():
     st.header("Termo de Consentimento Livre e Esclarecido (TCLE)")
-    st.info(
-        "Pesquisa com seres humanos no Brasil normalmente exige aprovação de um "
-        "Comitê de Ética (CEP) via Plataforma Brasil. Insira CAAE/parecer e contatos "
-        "no texto abaixo antes de coletar dados."
-    )
     st.markdown(CONSENT_TEXT)
 
     choice = st.radio(
@@ -385,21 +389,33 @@ def screen_demographics():
 
 
 def screen_material():
-    st.header("Treinamento — checklist para identificar deepfakes")
-    # TODO: replace with the real checklist training for group "Checklist".
-    st.write("Antes de classificar os vídeos, revise este checklist de verificação:")
-    st.markdown(
-        "1. **Bordas e transições** — o rosto se mistura de forma natural ao fundo, ao "
-        "cabelo e ao pescoço?\n"
-        "2. **Olhos e piscadas** — o olhar e a frequência de piscadas parecem naturais?\n"
-        "3. **Boca e fala** — os lábios acompanham o áudio? Há dentes/língua estranhos?\n"
-        "4. **Iluminação e sombras** — a luz no rosto é coerente com o ambiente?\n"
-        "5. **Textura de pele/cabelo** — há áreas borradas, cerosas ou artificiais?\n"
-        "6. **Fonte e contexto** — de onde vem o vídeo? A situação faz sentido?\n\n"
-        "A inspeção visual **não** basta sozinha: sempre considere a **fonte** e o "
-        "**contexto** da mídia."
+    st.header("Como inspecionar um vídeo")
+    st.write(
+        "Observe o vídeo com calma e verifique cada item abaixo. Nenhum sinal "
+        "isolado prova que o vídeo é falso; considere o conjunto."
     )
-    st.caption("〔Placeholder — substitua pelo material de treinamento definitivo.〕")
+    st.markdown(
+        "**Bordas e contornos**\n"
+        "- Transições não naturais entre o rosto e o fundo\n"
+        "- Mistura estranha entre regiões do rosto (linha do queixo ou do cabelo)\n"
+        "- Bordas borradas ou distorcidas ao redor de olhos, nariz e boca\n"
+        "- Fios de cabelo misturados de forma não natural ou cortados abruptamente\n\n"
+        "**Pele e nitidez**\n"
+        "- Pele lisa demais ou com manchas/texturas irregulares\n"
+        "- Diferença de nitidez entre o rosto e o restante da imagem\n\n"
+        "**Formato e simetria do rosto**\n"
+        "- Traços faciais distorcidos ou assimétricos\n"
+        "- Padrões estranhos em dentes, olhos ou orelhas\n\n"
+        "**Iluminação e sombras**\n"
+        "- Iluminação inconsistente entre o rosto e o fundo\n"
+        "- Sombras que não seguem a direção da luz\n"
+        "- Reflexos nos olhos que não combinam com a cena\n\n"
+        "**Fundo e artefatos**\n"
+        "- Regiões do fundo deformadas, duplicadas ou geometricamente inconsistentes\n"
+        "- Pequenos artefatos: borrões, \"fantasmas\" (ghosting) ou padrões de pixel estranhos"
+    )
+    st.info("Agora, você verá alguns vídeos e precisará distinguir se são "
+            "**legítimos** ou **deepfakes**.")
     if st.button("Concluí o treinamento e desejo continuar", type="primary"):
         go_to("check")
 
@@ -431,7 +447,7 @@ def screen_task():
     show_ai = group in GROUPS_WITH_AI_EXPLANATION
 
     st.header("Tarefa — assista e classifique os vídeos")
-    st.write("Para cada vídeo, indique se você o considera **autêntico** ou **gerado por IA**.")
+    st.write("Para cada vídeo, indique se você o considera **legítimo** ou **deepfake**.")
 
     stimuli, source = load_stimuli()
     if not stimuli:
@@ -459,8 +475,10 @@ def screen_task():
                     f"color:#888'>vídeo {idx}</div>", unsafe_allow_html=True)
 
             if show_ai:
-                st.info(f"🤖 Probabilidade estimada de ser deepfake (modelo): "
-                        f"**{fmt_prob(s.get('prob_deepfake'))}**")
+                mv = model_verdict(s.get("prob_deepfake"))
+                if mv:
+                    verdict, conf = mv
+                    st.info(f"🔎 **Resultado do modelo de detecção:** {verdict} ({conf:.0%})")
                 explanation = str(s.get("explanation", "")).strip()
                 if explanation:
                     st.markdown(f"**Explicação da IA:** {explanation}")
