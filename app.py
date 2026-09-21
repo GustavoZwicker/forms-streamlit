@@ -83,9 +83,9 @@ OPTIONS_2_3 = [
 CONSENT_TEXT = """
 **TERMO DE CONSENTIMENTO LIVRE E ESCLARECIDO**
 
-Você está sendo convidado(a) a participar da pesquisa **“[TÍTULO DO PROJETO]”**,
-conduzida por **[NOME DO PESQUISADOR]**, vinculada à **[INSTITUIÇÃO / PROGRAMA]**,
-sob orientação de **[NOME DO ORIENTADOR]**.
+Você está sendo convidado(a) a participar da pesquisa ITT - Vision,
+conduzida por Gustavo Zwicker, vinculada à UTFPR-CP,
+sob orientação de Rogério Pozza e Robson Bonidia.
 
 - **Objetivo:** avaliar como orientações de letramento digital e explicações de
   inteligência artificial ajudam pessoas a identificar vídeos faciais autênticos
@@ -93,7 +93,7 @@ sob orientação de **[NOME DO ORIENTADOR]**.
 - **Procedimentos:** você responderá a um questionário inicial, poderá receber um
   breve material educativo, assistirá a alguns vídeos e os classificará como
   autênticos ou gerados por IA, e responderá a questionários finais. Duração
-  estimada: **cerca de [X] minutos**.
+  estimada: **cerca de 15 minutos**.
 - **Riscos:** mínimos, limitados a eventual desconforto ou cansaço ao analisar os
   vídeos. Você pode interromper a participação a qualquer momento.
 - **Benefícios:** contribuir para o desenvolvimento de ferramentas de combate à
@@ -309,7 +309,7 @@ def screen_intro(mode):
     )
     if mode == "sqlite":
         st.warning(
-            "⚠️ **Modo de teste local (SQLite).** Configure o Supabase antes de "
+            "**Modo de teste local (SQLite).** Configure o Supabase antes de "
             "coletar dados reais."
         )
     if st.button("Começar", type="primary"):
