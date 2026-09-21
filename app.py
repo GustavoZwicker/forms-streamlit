@@ -32,6 +32,7 @@ import json
 import random
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -61,7 +62,7 @@ RESPONSE_HEADERS = [
     "age_range", "gender", "education",
     "ai_familiarity", "deepfake_knowledge", "social_media_freq", "used_ai",
     "check_2_1", "check_2_2", "check_2_3", "check_score",
-    "task_json", "task_score", "final_json", "complete",
+    "task_json", "task_timings_json", "task_score", "final_json", "complete",
 ]
 
 # Section 2 answer key (NOT shown to the participant).
@@ -350,6 +351,11 @@ def init_state():
     ss.setdefault("group", None)
     ss.setdefault("data", {})
     ss.setdefault("saved", False)
+    # Per-video task state: one video is shown and submitted at a time.
+    ss.setdefault("task_index", 0)
+    ss.setdefault("task_started_at", None)
+    ss.setdefault("task_answers", {})
+    ss.setdefault("task_timings", {})
 
 
 def go_to(step):
@@ -505,11 +511,16 @@ def screen_check():
 
 
 def screen_task():
-    group = st.session_state.group
+    """Show one stimulus at a time and collect classification, confidence, and timing."""
+    ss = st.session_state
+    group = ss.group
     show_ai = group in GROUPS_WITH_AI_EXPLANATION
 
     st.header("Tarefa — assista e classifique os vídeos")
-    st.write("Para cada vídeo, indique se você o considera **legítimo** ou **deepfake**.")
+    st.write(
+        "Assista a cada vídeo e indique se você o considera **legítimo** ou "
+        "**deepfake**. Após a classificação, informe sua confiança."
+    )
 
     stimuli, source = load_stimuli()
     if not stimuli:
@@ -519,50 +530,114 @@ def screen_task():
             "os arquivos para o bucket de Storage."
         )
         return
+
     if source == "test":
         st.caption("〔Modo de teste: vídeos indisponíveis; exibindo apenas a estrutura.〕")
 
-    with st.form("task"):
-        answers, labels = {}, {}
-        for idx, s in enumerate(stimuli, start=1):
-            st.markdown(f"**Vídeo {idx}**")
+    # Safety check if the session contains an invalid index.
+    if ss.task_index >= len(stimuli):
+        go_to("final")
+        return
 
-            url = video_url(s.get("video", ""))
-            if url:
-                st.video(url)
-            else:
-                st.markdown(
-                    "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
-                    "border-radius:8px;display:flex;align-items:center;justify-content:center;"
-                    f"color:#888'>vídeo {idx}</div>", unsafe_allow_html=True)
+    idx = ss.task_index
+    stimulus = stimuli[idx]
+    video_number = idx + 1
+    video_key = f"vid_{video_number}"
 
-            if show_ai:
-                mv = model_verdict(s.get("prob_deepfake"))
-                if mv:
-                    verdict, conf = mv
-                    st.info(f"🔎 **Resultado do modelo de detecção:** {verdict} ({conf:.0%})")
-                explanation = str(s.get("explanation", "")).strip()
-                if explanation:
-                    st.markdown(f"**Explicação da IA:** {explanation}")
+    st.progress(video_number / len(stimuli), text=f"Vídeo {video_number} de {len(stimuli)}")
+    st.subheader(f"Vídeo {video_number}")
 
-            key = f"vid_{idx}"
-            answers[key] = st.radio(f"Classificação do vídeo {idx} *", TASK_OPTIONS,
-                                    index=None, horizontal=True, key=key,
-                                    label_visibility="collapsed")
-            labels[key] = str(s.get("label", "")).strip()
-            st.divider()
-        submit = st.form_submit_button("Continuar", type="primary")
+    url = video_url(stimulus.get("video", ""))
+    if url:
+        st.video(url)
+    else:
+        st.markdown(
+            "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
+            "border-radius:8px;display:flex;align-items:center;justify-content:center;"
+            f"color:#888'>vídeo {video_number}</div>",
+            unsafe_allow_html=True,
+        )
+
+    if show_ai:
+        mv = model_verdict(stimulus.get("prob_deepfake"))
+        if mv:
+            verdict, model_confidence = mv
+            st.info(
+                f"🔎 **Resultado do modelo de detecção:** "
+                f"{verdict} ({model_confidence:.0%})"
+            )
+
+        explanation = str(stimulus.get("explanation", "")).strip()
+        if explanation:
+            st.markdown(f"**Explicação da IA:** {explanation}")
+
+    # Start the timer once, when this video is first rendered.
+    if ss.task_started_at is None:
+        ss.task_started_at = time.perf_counter()
+
+    with st.form(f"task_video_{video_number}"):
+        answer = st.radio(
+            "Classificação do vídeo *",
+            TASK_OPTIONS,
+            index=None,
+            horizontal=True,
+        )
+        confidence = st.radio(
+            "Qual é o seu nível de confiança nesta classificação? "
+            "(1 = Nada confiante … 5 = Muito confiante) *",
+            [1, 2, 3, 4, 5],
+            index=None,
+            horizontal=True,
+        )
+        submit_label = (
+            "Enviar classificação e avançar"
+            if video_number < len(stimuli)
+            else "Enviar classificação e finalizar tarefa"
+        )
+        submit = st.form_submit_button(submit_label, type="primary")
 
     if submit:
-        if any(v is None for v in answers.values()):
-            st.error("Classifique todos os vídeos antes de continuar.")
-        else:
-            st.session_state.data["task_json"] = json.dumps(answers, ensure_ascii=False)
-            if all(labels.values()):
-                score = sum(label_matches(labels[k], answers[k]) for k in answers)
-                st.session_state.data["task_score"] = score
-            go_to("final")
+        if answer is None or confidence is None:
+            st.error("Selecione a classificação e o nível de confiança.")
+            return
 
+        elapsed_seconds = round(time.perf_counter() - ss.task_started_at, 3)
+        ground_truth = str(stimulus.get("label", "")).strip()
+
+        ss.task_answers[video_key] = {
+            "answer": answer,
+            "confidence": confidence,
+        }
+        ss.task_timings[video_key] = {
+            "response_time_seconds": elapsed_seconds,
+            "video_number": video_number,
+        }
+
+        if ground_truth:
+            ss.task_answers[video_key]["correct"] = label_matches(
+                ground_truth, answer
+            )
+
+        # Keep the collected values in the existing participant data structure.
+        ss.data["task_json"] = json.dumps(ss.task_answers, ensure_ascii=False)
+        ss.data["task_timings_json"] = json.dumps(
+            ss.task_timings, ensure_ascii=False
+        )
+
+        if all(str(s.get("label", "")).strip() for s in stimuli):
+            ss.data["task_score"] = sum(
+                1
+                for i, s in enumerate(stimuli, start=1)
+                if ss.task_answers.get(f"vid_{i}", {}).get("correct") is True
+            )
+
+        ss.task_index += 1
+        ss.task_started_at = None
+
+        if ss.task_index >= len(stimuli):
+            go_to("final")
+        else:
+            st.rerun()
 
 def screen_final():
     st.header("Questionários finais")
@@ -702,7 +777,14 @@ def screen_admin():
         if not isinstance(task, dict):
             continue
 
-        for video_key, answer in task.items():
+        for video_key, answer_data in task.items():
+            # New format: {"answer": "...", "confidence": 1, ...}
+            if isinstance(answer_data, dict):
+                answer = answer_data.get("answer")
+            else:
+                # Backward compatibility with responses from the old app.
+                answer = answer_data
+
             if answer in TASK_OPTIONS:
                 group_answers[group][video_key].append(answer)
 
