@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Data-collection app for the deepfake-detection study.
+Data-collection app for the deepfake-detection study (Supabase backend).
 
 Groups (balanced in real time):
   - "Controle"  (group 1): no training. Watches the videos and classifies them.
@@ -11,30 +11,25 @@ Groups (balanced in real time):
 Flow:
   intro -> consent (TCLE) -> [GROUP ASSIGNMENT] -> demographics
         -> (Checklist) training -> (Checklist) learning check
-        -> classification task (videos from Google Drive) -> final questionnaires -> end
+        -> classification task (videos from Supabase Storage) -> final -> end
 
-Assignment: each consenting participant goes to the group furthest below its target
-proportion (WEIGHTS); equal weights (1:1:1) keep the three samples the same size.
-The read-choose-increment step is serialized by a process-wide lock (race-free on
-Streamlit Community Cloud's single instance).
+Assignment: a single Postgres function (assign_group) picks the group furthest
+below its target proportion and increments its count inside one transaction
+guarded by an advisory lock, so it is race-free even with many simultaneous
+participants and across app restarts.
 
-Storage & media:
-  - Responses + running counts -> Google Sheets (durable).
-  - Video stimuli              -> Google Drive folder, fetched via the service account.
-  - Stimulus metadata (which video, model probability, XAI explanation, ground-truth
-    label) -> a "stimuli" tab in the same spreadsheet, filled in by the researcher.
+Storage & media (Supabase):
+  - responses / counts / stimuli  -> Postgres tables.
+  - video stimuli                 -> a public Storage bucket ("videos").
   Without credentials the app falls back to local SQLite + placeholder stimuli
-  (testing only; Community Cloud wipes local files).
+  (testing only).
 
 NOTE: participant-facing text is Portuguese on purpose; the code is English.
 """
 
-import io
 import json
-import os
 import random
 import sqlite3
-import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -45,23 +40,17 @@ import streamlit as st
 # CONFIGURATION
 # =============================================================================
 
-# Internal group codes (also stored in the Sheet). See module docstring.
 GROUPS = ["Controle", "Checklist", "XAI"]
+WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}  # 1:1:1 => same-size samples
 
-# Target proportion between groups. Equal (1:1:1) => same-size samples.
-WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}
-
-# Only the Checklist group gets the training material + learning check.
 GROUPS_WITH_MATERIAL = {"Checklist"}
-# Only the XAI group sees the model probability + explanation during the task.
 GROUPS_WITH_AI_EXPLANATION = {"XAI"}
 
-# Classification options shown for each video.
 LABEL_AUTENTICO = "Autêntico"
 LABEL_DEEPFAKE = "Gerado por IA"
 TASK_OPTIONS = [LABEL_AUTENTICO, LABEL_DEEPFAKE]
 
-# Columns stored per participant (English schema).
+# Fields stored per participant. Note: "group" maps to DB column "grp".
 RESPONSE_HEADERS = [
     "timestamp", "participant_id", "group", "consented",
     "age_range", "gender", "education",
@@ -69,14 +58,6 @@ RESPONSE_HEADERS = [
     "check_2_1", "check_2_2", "check_2_3", "check_score",
     "task_json", "task_score", "final_json", "complete",
 ]
-
-# Columns of the "stimuli" tab (researcher-filled).
-#   order         : display order (number)
-#   video         : file NAME in the Drive folder (or a Drive file id)
-#   label         : ground truth: "real" / "deepfake" (optional; enables task_score)
-#   prob_deepfake : model probability, e.g. 0.87 or 87% (shown to XAI group)
-#   explanation   : XAI/LLM text explaining why it is real/deepfake (shown to XAI group)
-STIMULI_HEADERS = ["order", "video", "label", "prob_deepfake", "explanation"]
 
 # Section 2 answer key (NOT shown to the participant).
 ANSWER_2_1 = "Transições ou bordas não naturais entre o rosto e o fundo"
@@ -127,18 +108,17 @@ sob orientação de **[NOME DO ORIENTADOR]**.
 """
 
 # =============================================================================
-# INFRASTRUCTURE (lock + assignment)
+# ASSIGNMENT HELPERS (used by the local SQLite fallback)
 # =============================================================================
 
 
 @st.cache_resource
 def get_lock() -> threading.Lock:
-    """Single lock shared across every session in this instance."""
     return threading.Lock()
 
 
 def choose_group(counts: dict) -> str:
-    """Return the group that minimizes (n+1)/weight; ties broken at random."""
+    """Group that minimizes (n+1)/weight; ties broken at random."""
     best_val = None
     candidates = []
     for g in GROUPS:
@@ -155,72 +135,43 @@ def choose_group(counts: dict) -> str:
 # STORAGE BACKENDS
 # =============================================================================
 
-class SheetsStorage:
+@st.cache_resource
+def _supabase_client():
+    from supabase import create_client
+    return create_client(
+        st.secrets["supabase"]["url"],
+        st.secrets["supabase"]["service_key"],
+    )
+
+
+class SupabaseStorage:
     def __init__(self):
-        import gspread
-        from google.oauth2.service_account import Credentials
-
-        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-        info = dict(st.secrets["gcp_service_account"])
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
-        self._gspread = gspread
-        self.client = gspread.authorize(creds)
-        self.sh = self.client.open_by_key(st.secrets["spreadsheet"]["spreadsheet_key"])
-        self.responses_ws = self._ws("responses", RESPONSE_HEADERS)
-        self.counts_ws = self._ws("counts", ["group", "n"])
-        self._ensure_counts()
-
-    def _ws(self, name, headers):
-        try:
-            ws = self.sh.worksheet(name)
-        except self._gspread.WorksheetNotFound:
-            ws = self.sh.add_worksheet(title=name, rows=2000, cols=max(12, len(headers)))
-        if not ws.row_values(1):
-            ws.append_row(headers)
-        return ws
-
-    def _ensure_counts(self):
-        existing = {r["group"] for r in self.counts_ws.get_all_records()}
-        for g in GROUPS:
-            if g not in existing:
-                self.counts_ws.append_row([g, 0])
+        self.client = _supabase_client()
 
     def counts(self) -> dict:
-        return {r["group"]: int(r["n"]) for r in self.counts_ws.get_all_records()}
-
-    def _set_count(self, group, n):
-        for i, r in enumerate(self.counts_ws.get_all_records(), start=2):  # row 1 = header
-            if r["group"] == group:
-                self.counts_ws.update_cell(i, 2, n)
-                return
+        res = self.client.table("counts").select("grp, n").execute()
+        return {r["grp"]: int(r["n"]) for r in (res.data or [])}
 
     def assign_group(self) -> str:
-        with get_lock():
-            counts = self.counts()
-            group = choose_group(counts)
-            self._set_count(group, counts.get(group, 0) + 1)
-            return group
+        # Atomic + race-free: all logic lives in the Postgres function.
+        res = self.client.rpc("assign_group", {}).execute()
+        data = res.data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        return data
 
     def get_stimuli(self) -> list:
-        ws = self._ws("stimuli", STIMULI_HEADERS)
-        rows = ws.get_all_records()
-
-        def _key(r):
-            try:
-                return float(r.get("order", 0) or 0)
-            except (TypeError, ValueError):
-                return 0.0
-        return sorted(rows, key=_key)
+        res = self.client.table("stimuli").select("*").order("sort_order").execute()
+        return res.data or []
 
     def save_response(self, row: dict):
-        self.responses_ws.append_row(
-            [str(row.get(h, "")) for h in RESPONSE_HEADERS],
-            value_input_option="RAW",
-        )
+        data = {h: str(row.get(h, "")) for h in RESPONSE_HEADERS}
+        data["grp"] = data.pop("group")  # DB column is "grp"
+        self.client.table("responses").insert(data).execute()
 
 
 class SQLiteStorage:
-    """Local fallback for testing only (Community Cloud wipes local files)."""
+    """Local fallback for testing only."""
 
     def __init__(self, path="responses.db"):
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -244,7 +195,7 @@ class SQLiteStorage:
             return group
 
     def get_stimuli(self) -> list:
-        return []  # no stimuli sheet locally; placeholders are used instead
+        return []
 
     def save_response(self, row: dict):
         ph = ", ".join("?" * len(RESPONSE_HEADERS))
@@ -255,90 +206,43 @@ class SQLiteStorage:
         self.conn.commit()
 
 
-def _has_sheets() -> bool:
+def _has_supabase() -> bool:
     try:
-        return "gcp_service_account" in st.secrets and "spreadsheet" in st.secrets
+        return "supabase" in st.secrets
     except Exception:
         return False
 
 
 @st.cache_resource
 def get_storage():
-    if _has_sheets():
-        return SheetsStorage(), "sheets"
+    if _has_supabase():
+        return SupabaseStorage(), "supabase"
     return SQLiteStorage(), "sqlite"
 
 
 # =============================================================================
-# GOOGLE DRIVE (video stimuli)
+# VIDEO / STIMULI HELPERS
 # =============================================================================
 
-@st.cache_resource
-def _drive_service():
-    from googleapiclient.discovery import build
-    from google.oauth2.service_account import Credentials
-
-    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = Credentials.from_service_account_info(
-        dict(st.secrets["gcp_service_account"]), scopes=scopes)
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
-
-
-@st.cache_data(show_spinner=False, ttl=300)
-def drive_name_map() -> dict:
-    """Map {filename: file_id} for the configured Drive folder (refreshes every 5 min)."""
-    try:
-        folder_id = st.secrets["drive"]["folder_id"]
-    except Exception:
-        return {}
-    service = _drive_service()
-    files, page_token = {}, None
-    while True:
-        resp = service.files().list(
-            q=f"'{folder_id}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name)",
-            pageToken=page_token,
-        ).execute()
-        for f in resp.get("files", []):
-            files[f["name"]] = f["id"]
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return files
-
-
-@st.cache_resource(show_spinner=False)
-def get_video_path(file_id: str) -> str:
-    """Download a Drive video once to a local temp file; return its path."""
-    from googleapiclient.http import MediaIoBaseDownload
-
-    path = os.path.join(tempfile.gettempdir(), f"stimulus_{file_id}.mp4")
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        service = _drive_service()
-        request = service.files().get_media(fileId=file_id)
-        fh = io.FileIO(path, "wb")
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        fh.close()
-    return path
-
-
-def safe_video_path(file_id: str):
-    try:
-        return get_video_path(file_id)
-    except Exception:
+def video_url(video_value: str):
+    """Full URL for a stimulus: a public Storage URL from the filename, or the
+    value itself if it is already a URL."""
+    v = str(video_value).strip()
+    if not v:
         return None
+    if v.startswith("http://") or v.startswith("https://"):
+        return v
+    base = st.secrets["supabase"]["url"].rstrip("/")
+    bucket = st.secrets["supabase"].get("bucket", "videos")
+    return f"{base}/storage/v1/object/public/{bucket}/{v}"
 
 
 def fmt_prob(value) -> str:
-    """Format a probability (0.87, '0,87', '87%', 87) as a percentage string."""
     try:
-        v = float(str(value).replace("%", "").replace(",", ".").strip())
-        if v > 1:
-            v /= 100.0
-        return f"{v * 100:.0f}%"
+        x = float(str(value).replace("%", "").replace(",", ".").strip())
+        if x > 1:
+            x /= 100.0
+        return f"{x * 100:.0f}%"
     except (TypeError, ValueError):
         return str(value)
 
@@ -355,13 +259,13 @@ def label_matches(ground_truth: str, answer: str) -> bool:
 def load_stimuli():
     """Return (list_of_stimulus_dicts, mode). In test mode, returns placeholders."""
     storage, mode = get_storage()
-    if mode == "sheets":
+    if mode == "supabase":
         try:
-            return storage.get_stimuli(), "sheets"
+            return storage.get_stimuli(), "supabase"
         except Exception:
-            return [], "sheets"
+            return [], "supabase"
     dummies = [
-        {"order": i, "video": "", "label": "",
+        {"sort_order": i, "video": "", "label": "",
          "prob_deepfake": "0.5",
          "explanation": f"〔explicação XAI de exemplo para o vídeo {i}〕"}
         for i in range(1, 4)
@@ -405,9 +309,8 @@ def screen_intro(mode):
     )
     if mode == "sqlite":
         st.warning(
-            "⚠️ **Modo de teste local (SQLite).** Configure o Google Sheets e o Google "
-            "Drive antes de coletar dados reais — no Streamlit Community Cloud o "
-            "armazenamento local é apagado a cada reinício do app."
+            "⚠️ **Modo de teste local (SQLite).** Configure o Supabase antes de "
+            "coletar dados reais."
         )
     if st.button("Começar", type="primary"):
         go_to("consent")
@@ -534,26 +437,22 @@ def screen_task():
     stimuli, source = load_stimuli()
     if not stimuli:
         st.warning(
-            "Nenhum vídeo configurado. Preencha a aba **stimuli** da planilha "
-            "(colunas: order, video, label, prob_deepfake, explanation) e coloque os "
-            "arquivos na pasta do Google Drive."
+            "Nenhum vídeo configurado. Preencha a tabela **stimuli** no Supabase "
+            "(colunas: sort_order, video, label, prob_deepfake, explanation) e envie "
+            "os arquivos para o bucket de Storage."
         )
         return
     if source == "test":
         st.caption("〔Modo de teste: vídeos indisponíveis; exibindo apenas a estrutura.〕")
-
-    name_map = drive_name_map()
 
     with st.form("task"):
         answers, labels = {}, {}
         for idx, s in enumerate(stimuli, start=1):
             st.markdown(f"**Vídeo {idx}**")
 
-            video_value = str(s.get("video", "")).strip()
-            file_id = name_map.get(video_value, video_value)  # filename -> id, else assume id
-            path = safe_video_path(file_id) if file_id else None
-            if path:
-                st.video(path)
+            url = video_url(s.get("video", ""))
+            if url:
+                st.video(url)
             else:
                 st.markdown(
                     "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
@@ -580,7 +479,7 @@ def screen_task():
             st.error("Classifique todos os vídeos antes de continuar.")
         else:
             st.session_state.data["task_json"] = json.dumps(answers, ensure_ascii=False)
-            if all(labels.values()):  # score only if every stimulus has a ground-truth label
+            if all(labels.values()):
                 score = sum(label_matches(labels[k], answers[k]) for k in answers)
                 st.session_state.data["task_score"] = score
             go_to("final")

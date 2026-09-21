@@ -1,3 +1,2 @@
 streamlit>=1.32
-gspread>=6.0
-google-auth>=2.28
+supabase>=2.4

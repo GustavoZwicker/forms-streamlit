@@ -1,26 +1,71 @@
-# Coleta — Pesquisa sobre deepfakes
+# Coleta — Pesquisa sobre deepfakes (vídeos) · backend Supabase
 
-App em Streamlit que aplica o questionário e **distribui cada participante, em
-tempo real, para um de três grupos** (Controle, G1, G2), mantendo as amostras
-equilibradas.
+App em Streamlit que aplica o questionário, **distribui cada participante em tempo
+real** para um de três grupos (mantendo as amostras equilibradas) e apresenta
+**vídeos hospedados no Supabase Storage** para classificação. Todos os dados ficam
+no **Postgres do Supabase** — sem Google Cloud.
 
-## Como funciona a distribuição
+## Os três grupos
 
-Quando alguém consente no TCLE, o app olha as contagens atuais e aloca a pessoa
-ao grupo mais "atrasado" em relação à sua proporção-alvo — minimiza `(n+1)/peso`,
-com desempate aleatório. Com pesos iguais (`1:1:1`, padrão), isso mantém os três
-grupos **do mesmo tamanho** durante toda a coleta.
+- **Controle** — sem treinamento. Assiste aos vídeos e classifica.
+- **Checklist** — treinamento com checklist + verificação (Seção 2) e depois classifica.
+- **XAI** — classifica os vídeos exibidos junto com a **probabilidade de deepfake do
+  modelo** e uma **explicação (XAI/LLM)** de por que o vídeo é real ou manipulado.
 
-- Para dar peso diferente a um grupo ("necessidade proporcional"), edite `PESOS`
-  em `app.py`. Ex.: `{"Controle": 1, "G1": 1, "G2": 2}` aloca o dobro ao G2.
-- A decisão *ler → escolher → incrementar* é serializada por um `Lock` de
-  processo. No **Streamlit Community Cloud** (instância única) isso elimina
-  qualquer condição de corrida entre participantes simultâneos. Se um dia rodar
-  em várias réplicas, troque o backend por um banco com incremento atômico
-  (ex.: Postgres/Supabase RPC).
-- A atribuição é contada no **consentimento**. Quem desistir depois deixa uma
-  pequena diferença entre grupos; para analisar só quem terminou, filtre pela
-  coluna `completo`.
+## Distribuição balanceada
+
+Ao consentir, o participante é alocado por uma função Postgres (`assign_group`) que
+escolhe o grupo mais "atrasado" em relação ao peso e incrementa a contagem numa única
+transação protegida por advisory lock — **atômica e sem condição de corrida**, mesmo
+com muitos participantes simultâneos. Pesos iguais (1:1:1) mantêm os grupos do mesmo
+tamanho. Para mudar a proporção: `update counts set weight = 2 where grp = 'XAI';`.
+
+## Probabilidade e explicação da IA (grupo XAI)
+
+O app **não** roda o detector nem o LLM ao vivo — cada participante deve ver a mesma
+explicação para o mesmo vídeo (controle experimental). Você fornece esses valores
+**pré-calculados** na tabela `stimuli` (colunas `prob_deepfake` e `explanation`). Só o
+grupo XAI os vê.
+
+## Configurar o Supabase (uma vez)
+
+1. **Tabelas + função:** Dashboard -> **SQL Editor** -> New query -> cole o conteúdo de
+   `supabase_setup.sql` -> **Run**. Isso cria `counts`, `responses`, `stimuli` e a
+   função `assign_group`.
+2. **Bucket de vídeos:** Dashboard -> **Storage** -> **New bucket** -> nome `videos`,
+   marque **Public bucket** -> Create. Faça **Upload** dos seus `.mp4` nesse bucket.
+   (Bucket público serve os vídeos direto ao navegador; os dados no banco continuam
+   privados.)
+3. **Estímulos:** Dashboard -> **Table Editor** -> `stimuli` -> Insert row, uma por
+   vídeo:
+
+   | sort_order | video       | label    | prob_deepfake | explanation                   |
+   |------------|-------------|----------|---------------|-------------------------------|
+   | 1          | video01.mp4 | real     | 0.12          | Bordas e iluminacao naturais… |
+   | 2          | video02.mp4 | deepfake | 0.88          | Piscadas irregulares e…       |
+
+   - `video`: nome do arquivo no bucket (ou uma URL completa).
+   - `label`: `real`/`deepfake` — opcional; se preenchido em todos, calcula `task_score`.
+   - `prob_deepfake` / `explanation`: mostrados **apenas ao grupo XAI**.
+4. **Chaves:** Dashboard -> **Project Settings -> API**. Copie a **Project URL** e a
+   chave **`service_role`** (a secreta, não a `anon`).
+
+## Secrets
+
+Preencha `.streamlit/secrets.toml.example` (a `url` já vem preenchida com seu projeto):
+
+```toml
+[supabase]
+url = "https://zmfhaffmytoefywtpbpn.supabase.co"
+service_key = "SUA_CHAVE_SERVICE_ROLE"
+bucket = "videos"
+
+[admin]
+key = "uma-senha-forte"
+```
+
+A chave `service_role` roda **só no servidor** (Streamlit) e ignora o RLS, então os
+dados ficam acessíveis apenas por quem tem a chave. **Nunca** a exponha nem faça commit.
 
 ## Rodar localmente (teste)
 
@@ -29,36 +74,28 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Sem credenciais, o app usa **SQLite** (`respostas.db`) só para teste. **Não use
-SQLite para coleta real**: no Cloud o disco é apagado a cada reinício.
+Sem os secrets do Supabase, o app usa **SQLite** (`responses.db`) e stimuli de exemplo,
+só para percorrer o fluxo.
 
 ## Publicar (Streamlit Community Cloud — grátis)
 
 1. Suba esta pasta para um repositório no **GitHub**.
-2. Crie uma **planilha** no Google Sheets e copie o ID (parte da URL entre `/d/`
-   e `/edit`).
-3. No **Google Cloud Console**: crie um projeto → ative a **Google Sheets API**
-   → crie uma **Service Account** → gere uma **chave JSON**.
-4. **Compartilhe a planilha** com o `client_email` da service account, como
-   **Editor**.
-5. Em [share.streamlit.io](https://share.streamlit.io), clique **New app**,
-   aponte para o repositório e `app.py`, e faça deploy.
-6. Em **Settings → Secrets**, cole o conteúdo de `.streamlit/secrets.toml.example`
-   preenchido (dados do JSON + `spreadsheet_key` + `admin.key`).
-7. Abra o app e teste. O app cria sozinho as abas `respostas` e `contagem`.
+2. Em [share.streamlit.io](https://share.streamlit.io) -> **New app**, aponte para o
+   repositório e `app.py`, e faça deploy.
+3. Em **Settings -> Secrets**, cole o conteúdo do `secrets.toml` preenchido.
+4. Abra o app e faça um teste de ponta a ponta.
 
-## Painel de contagens
+## Painel do pesquisador
 
-Acesse `SUA_URL/?admin=SUA_CHAVE` (a `admin.key` dos secrets) para ver quantos
-participantes há em cada grupo.
+Acesse `SUA_URL/?admin` e informe a senha (`admin.key`) para ver as contagens por
+grupo. A senha **não** vai na URL. Os dados completos estão no Table Editor do Supabase
+(exportáveis em CSV).
 
 ## O que ainda falta preencher
 
-O formulário base (MD) cobre TCLE, sociodemográfico e verificação de aprendizagem.
-Estão como *placeholder* em `app.py`, marcados com `TODO`/`〔...〕`:
+Marcados com `TODO`/`〔...〕` em `app.py`:
 
 - **Campos do TCLE** entre colchetes (título, pesquisador, CEP/CAAE, duração).
-- **Material educativo** (`tela_material`).
-- **12 imagens** da tarefa (coloque em `imagens/1.jpg … 12.jpg`) e a
-  **explicação da IA** mostrada ao G2 (`tela_tarefa`).
-- **Questionários finais** (`tela_final`).
+- **Treinamento com checklist** do grupo Checklist (`screen_material`).
+- **Vídeos** (bucket) e a tabela **`stimuli`** com `prob_deepfake`/`explanation`.
+- **Questionários finais** (`screen_final`).
