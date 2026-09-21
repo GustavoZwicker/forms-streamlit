@@ -417,7 +417,7 @@ def screen_demographics():
     st.caption("Campos com * são obrigatórios.")
     with st.form("demographics"):
         age = st.radio("1.1 Qual é a sua faixa etária? *",
-                       ["18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
+                       ["<18", "18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
         gender = st.radio("1.2 Com qual gênero você se identifica?",
                           ["Feminino", "Masculino", "Outro", "Prefiro não responder"], index=None)
         education = st.radio("1.3 Nível de escolaridade mais alto já concluído? *",
