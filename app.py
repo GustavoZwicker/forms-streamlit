@@ -45,8 +45,11 @@ import streamlit as st
 GROUPS = ["Controle", "Checklist", "XAI"]
 WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}  # 1:1:1 => same-size samples
 
-GROUPS_WITH_MATERIAL = {"Checklist"}
-GROUPS_WITH_AI_EXPLANATION = {"XAI"}
+GROUPS_WITH_MATERIAL = {"Checklist", "Todos"}
+GROUPS_WITH_AI_EXPLANATION = {"XAI", "Todos"}
+
+# Researcher-only preview options. "Todos" enables every group-specific feature.
+DEBUG_GROUP_OPTIONS = ["Normal", "Controle", "Checklist", "XAI", "Todos"]
 
 # Demographic variables kept balanced across groups (minimization). Fewer factors
 # => stronger balance on each. Must be collected BEFORE assignment (Section 1).
@@ -363,8 +366,20 @@ def go_to(step):
     st.rerun()
 
 
+def effective_group():
+    """Return the group whose features should be active in this session.
+
+    The researcher can temporarily override the assigned group from the admin
+    panel. The override is session-local and does not affect database assignment.
+    """
+    debug_group = st.session_state.get("debug_group", "Normal")
+    if debug_group != "Normal":
+        return debug_group
+    return st.session_state.get("group")
+
+
 def next_after_demographics():
-    return "material" if st.session_state.group in GROUPS_WITH_MATERIAL else "task"
+    return "material" if effective_group() in GROUPS_WITH_MATERIAL else "task"
 
 
 # =============================================================================
@@ -513,7 +528,7 @@ def screen_check():
 def screen_task():
     """Show one stimulus at a time and collect classification, confidence, and timing."""
     ss = st.session_state
-    group = ss.group
+    group = effective_group()
     show_ai = group in GROUPS_WITH_AI_EXPLANATION
 
     st.header("Tarefa — assista e classifique os vídeos")
@@ -681,14 +696,72 @@ def screen_end():
 
     st.header("Obrigado por participar! ✅")
     st.write("Suas respostas foram registradas de forma anônima.")
-    st.success(f"Você participou do grupo: **{ss.group}**")
+    st.success(f"Grupo atribuído: **{ss.group}**")
+    if ss.get("debug_group", "Normal") != "Normal":
+        st.caption(f"Configuração de depuração aplicada: **{ss.debug_group}**")
     st.caption("Anote esta informação caso precise informá-la à equipe da pesquisa.")
     st.write("Você pode fechar esta janela.")
+    if ss.get("debug_group", "Normal") != "Normal":
+        st.info(
+            "Modo de depuração ativo: "
+            f"as características exibidas foram **{ss.debug_group}**. "
+            "Essa execução não deve ser usada como resposta de participante."
+        )
 
 
 def screen_admin():
     """Password-protected researcher dashboard."""
     st.header("Researcher panel")
+
+    # -------------------------------------------------------------------------
+    # Researcher-only feature debugging
+    # -------------------------------------------------------------------------
+    st.subheader("Feature debugging / participant preview")
+    st.caption(
+        "Choose which group-specific features should be active in a preview. "
+        "This override is local to the current session and does not change the "
+        "participant's assigned group or the balancing counters."
+    )
+
+    current_debug_group = st.session_state.get("debug_group", "Normal")
+    debug_group = st.selectbox(
+        "Feature configuration",
+        options=DEBUG_GROUP_OPTIONS,
+        index=DEBUG_GROUP_OPTIONS.index(current_debug_group)
+        if current_debug_group in DEBUG_GROUP_OPTIONS else 0,
+        key="admin_debug_group",
+        help=(
+            "Normal uses the assigned group. Todos enables Checklist material, "
+            "the learning check, model probability, and XAI explanation."
+        ),
+    )
+    st.session_state["debug_group"] = debug_group
+
+    debug_features = {
+        "Assigned group used": st.session_state.get("group") or "Not assigned yet",
+        "Active feature group": debug_group,
+        "Checklist material": "Enabled" if debug_group in GROUPS_WITH_MATERIAL else "Disabled",
+        "Learning check": "Enabled" if debug_group in GROUPS_WITH_MATERIAL else "Disabled",
+        "Model probability": "Enabled" if debug_group in GROUPS_WITH_AI_EXPLANATION else "Disabled",
+        "XAI explanation": "Enabled" if debug_group in GROUPS_WITH_AI_EXPLANATION else "Disabled",
+    }
+    st.table([{"Feature": key, "Status": value} for key, value in debug_features.items()])
+
+    if st.button("Launch participant preview", type="primary"):
+        # Start a fresh preview while preserving the selected debug configuration.
+        st.session_state["step"] = "intro"
+        st.session_state["pid"] = "DEBUG-" + str(uuid.uuid4())
+        st.session_state["group"] = None
+        st.session_state["data"] = {}
+        st.session_state["saved"] = False
+        st.session_state["task_index"] = 0
+        st.session_state["task_started_at"] = None
+        st.session_state["task_answers"] = {}
+        st.session_state["task_timings"] = {}
+        st.query_params.clear()
+        st.rerun()
+
+    st.divider()
 
     try:
         storage, mode = get_storage()
