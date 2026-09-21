@@ -103,8 +103,7 @@ sob orientação de Rogério Pozza e Robson Bonidia.
 - **Confidencialidade e dados (LGPD – Lei nº 13.709/2018):** **não** serão coletados
   dados que identifiquem você pessoalmente. As respostas serão armazenadas de forma
   anonimizada e usadas apenas para fins acadêmicos e científicos, de forma agregada.
-- **Contatos:** Pesquisador(a) responsável — [NOME], [E-MAIL/TELEFONE].
-  Comitê de Ética em Pesquisa (CEP) — [NOME DO CEP], [ENDEREÇO], [TELEFONE/E-MAIL].
+- **Contatos:** Pesquisador(a) responsável — Gustavo Zwicker, gustavogzwicker@gmail.com.
 """
 
 # =============================================================================
@@ -305,7 +304,7 @@ def screen_intro(mode):
         "Obrigado pelo seu interesse. Nesta pesquisa você responderá a algumas "
         "perguntas e assistirá a vídeos de rostos, indicando se são autênticos ou "
         "gerados por inteligência artificial. A participação é anônima e leva "
-        "cerca de **[X] minutos**."
+        "cerca de **15 minutos**."
     )
     if mode == "sqlite":
         st.warning(
