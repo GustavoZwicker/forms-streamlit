@@ -27,6 +27,7 @@ Storage & media (Supabase):
 NOTE: participant-facing text is Portuguese on purpose; the code is English.
 """
 
+import collections
 import json
 import random
 import sqlite3
@@ -45,6 +46,10 @@ WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}  # 1:1:1 => same-size sample
 
 GROUPS_WITH_MATERIAL = {"Checklist"}
 GROUPS_WITH_AI_EXPLANATION = {"XAI"}
+
+# Demographic variables kept balanced across groups (minimization). Fewer factors
+# => stronger balance on each. Must be collected BEFORE assignment (Section 1).
+BALANCE_FACTORS = ["ai_familiarity", "deepfake_knowledge", "education", "age_range"]
 
 LABEL_AUTENTICO = "Legítimo"
 LABEL_DEEPFAKE = "Deepfake"
@@ -152,13 +157,17 @@ class SupabaseStorage:
         res = self.client.table("counts").select("grp, n").execute()
         return {r["grp"]: int(r["n"]) for r in (res.data or [])}
 
-    def assign_group(self) -> str:
-        # Atomic + race-free: all logic lives in the Postgres function.
-        res = self.client.rpc("assign_group", {}).execute()
+    def assign_group(self, factors=None) -> str:
+        # Atomic + race-free: minimization runs inside the Postgres function.
+        res = self.client.rpc("assign_group_min", {"p_factors": factors or {}}).execute()
         data = res.data
         if isinstance(data, list):
             data = data[0] if data else None
         return data
+
+    def strata(self) -> list:
+        res = self.client.table("strata_counts").select("*").execute()
+        return res.data or []
 
     def get_stimuli(self) -> list:
         res = self.client.table("stimuli").select("*").order("sort_order").execute()
@@ -177,6 +186,20 @@ class SupabaseStorage:
         data["grp"] = data.pop("group")  # DB column is "grp"
         self.client.table("responses").insert(data).execute()
 
+    def get_responses(self) -> list:
+        """Return completed participant responses for the researcher dashboard."""
+        res = (
+            self.client
+            .table("responses")
+            .select(
+                "participant_id, grp, task_json, task_score, "
+                "complete, timestamp"
+            )
+            .eq("complete", "Sim")
+            .execute()
+        )
+        return res.data or []
+
 
 class SQLiteStorage:
     """Local fallback for testing only."""
@@ -194,13 +217,16 @@ class SQLiteStorage:
     def counts(self) -> dict:
         return {g: n for g, n in self.conn.execute("SELECT grp, n FROM counts")}
 
-    def assign_group(self) -> str:
+    def assign_group(self, factors=None) -> str:
         with get_lock():
             counts = self.counts()
             group = choose_group(counts)
             self.conn.execute("UPDATE counts SET n = n + 1 WHERE grp = ?", (group,))
             self.conn.commit()
             return group
+
+    def strata(self) -> list:
+        return []
 
     def get_stimuli(self) -> list:
         return []
@@ -212,6 +238,19 @@ class SQLiteStorage:
             [str(row.get(h, "")) for h in RESPONSE_HEADERS],
         )
         self.conn.commit()
+
+    def get_responses(self) -> list:
+        """Return completed participant responses for the researcher dashboard."""
+        columns = [
+            "participant_id", "group", "task_json", "task_score",
+            "complete", "timestamp"
+        ]
+        rows = self.conn.execute(
+            "SELECT participant_id, group, task_json, task_score, "
+            "complete, timestamp FROM responses WHERE complete = ?",
+            ("Sim",)
+        ).fetchall()
+        return [dict(zip(columns, row)) for row in rows]
 
 
 def _has_supabase() -> bool:
@@ -232,17 +271,27 @@ def get_storage():
 # VIDEO / STIMULI HELPERS
 # =============================================================================
 
+@st.cache_data(show_spinner=False, ttl=3000)
+def _signed_url(path: str):
+    storage, _ = get_storage()
+    try:
+        return storage.signed_url(path)
+    except Exception:
+        return None
+
+
 def video_url(video_value: str):
-    """Full URL for a stimulus: a public Storage URL from the filename, or the
-    value itself if it is already a URL."""
+    """A time-limited signed Storage URL (works with a PRIVATE bucket), or the
+    value itself if it is already a full URL."""
     v = str(video_value).strip()
     if not v:
         return None
     if v.startswith("http://") or v.startswith("https://"):
         return v
-    base = st.secrets["supabase"]["url"].rstrip("/")
-    bucket = st.secrets["supabase"].get("bucket", "videos")
-    return f"{base}/storage/v1/object/public/{bucket}/{v}"
+    storage, mode = get_storage()
+    if mode != "supabase":
+        return None
+    return _signed_url(v)
 
 
 def parse_prob(value):
@@ -348,9 +397,6 @@ def screen_consent():
         elif choice.startswith("Não"):
             go_to("declined")
         else:
-            if st.session_state.group is None:  # assign exactly once per session
-                storage, _ = get_storage()
-                st.session_state.group = storage.assign_group()
             st.session_state.data["consented"] = "Sim"
             go_to("demographics")
 
@@ -394,6 +440,13 @@ def screen_demographics():
                 "ai_familiarity": ai_familiarity, "deepfake_knowledge": deepfake_knowledge,
                 "social_media_freq": social_media_freq, "used_ai": used_ai,
             })
+            # Assign AFTER demographics so the groups stay balanced on them.
+            if st.session_state.group is None:
+                storage, _ = get_storage()
+                factors = {f: str(st.session_state.data.get(f))
+                           for f in BALANCE_FACTORS
+                           if st.session_state.data.get(f) is not None}
+                st.session_state.group = storage.assign_group(factors)
             go_to(next_after_demographics())
 
 
@@ -559,17 +612,161 @@ def screen_end():
 
 
 def screen_admin():
+    """Password-protected researcher dashboard."""
     st.header("Researcher panel")
+
     try:
         storage, mode = get_storage()
         counts = storage.counts()
     except Exception as e:  # noqa: BLE001
         st.error(f"Failed to read counts: {e}")
         return
-    st.metric("Total assigned", sum(counts.values()))
-    st.write({g: counts.get(g, 0) for g in GROUPS})
-    st.caption(f"Backend: {mode} · target weights: {WEIGHTS}")
 
+    st.subheader("Participant distribution")
+    metric_cols = st.columns(len(GROUPS))
+    for col, group in zip(metric_cols, GROUPS):
+        col.metric(group, counts.get(group, 0))
+
+    st.metric("Total assigned", sum(counts.values()))
+    st.caption(f"Backend: {mode} · target weights: {WEIGHTS}")
+    st.divider()
+
+    # Demographic balance
+    try:
+        rows = storage.strata() if hasattr(storage, "strata") else []
+    except Exception:
+        rows = []
+
+    if rows:
+        st.subheader("Demographic balance")
+        by_factor = collections.defaultdict(
+            lambda: collections.defaultdict(dict)
+        )
+        for row in rows:
+            by_factor[row["factor"]][str(row["level"])][row["grp"]] = row["n"]
+
+        for factor in sorted(by_factor):
+            st.caption(factor)
+            table = [
+                {
+                    "level": level,
+                    **{group: levels.get(group, 0) for group in GROUPS},
+                }
+                for level, levels in sorted(by_factor[factor].items())
+            ]
+            st.table(table)
+
+    st.divider()
+    st.subheader("Video inference comparison")
+
+    try:
+        responses = storage.get_responses()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Failed to read participant responses: {e}")
+        return
+
+    if not responses:
+        st.info("No completed participant responses found.")
+        return
+
+    stimuli, _ = load_stimuli()
+    if not stimuli:
+        st.warning("No stimuli configured.")
+        return
+
+    selected_groups = st.multiselect(
+        "Groups to compare",
+        options=GROUPS,
+        default=GROUPS,
+        key="admin_selected_groups",
+    )
+    if not selected_groups:
+        st.info("Select at least one group to compare.")
+        return
+
+    group_answers = {
+        group: collections.defaultdict(list)
+        for group in GROUPS
+    }
+
+    for response in responses:
+        group = response.get("grp") or response.get("group")
+        if group not in GROUPS:
+            continue
+
+        try:
+            task = json.loads(response.get("task_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+
+        if not isinstance(task, dict):
+            continue
+
+        for video_key, answer in task.items():
+            if answer in TASK_OPTIONS:
+                group_answers[group][video_key].append(answer)
+
+    show_videos = st.checkbox(
+        "Show videos in the Admin panel",
+        value=True,
+        key="admin_show_videos",
+    )
+    show_researcher_info = st.checkbox(
+        "Show ground truth, model probability, and XAI explanation",
+        value=True,
+        key="admin_show_researcher_info",
+    )
+
+    st.caption(
+        "Percentages use submitted answers for each video and group. "
+        "Missing answers are excluded."
+    )
+
+    for idx, stimulus in enumerate(stimuli, start=1):
+        video_key = f"vid_{idx}"
+        st.markdown(f"## Video {idx}")
+
+        if show_videos:
+            url = video_url(stimulus.get("video", ""))
+            if url:
+                st.video(url)
+            else:
+                st.warning("Video unavailable for this stimulus.")
+
+        if show_researcher_info:
+            with st.expander("Researcher information", expanded=False):
+                st.write("Ground truth:", stimulus.get("label", ""))
+                st.write(
+                    "Model deepfake probability:",
+                    stimulus.get("prob_deepfake", ""),
+                )
+                explanation = str(stimulus.get("explanation", "")).strip()
+                if explanation:
+                    st.markdown("**XAI explanation:**")
+                    st.write(explanation)
+
+        comparison = []
+        for group in selected_groups:
+            answers = group_answers[group][video_key]
+            n = len(answers)
+            n_real = answers.count(LABEL_AUTENTICO)
+            n_fake = answers.count(LABEL_DEEPFAKE)
+
+            comparison.append({
+                "Group": group,
+                "Responses": n,
+                "Legitimate (n)": n_real,
+                "Legitimate (%)": round(n_real / n * 100, 2) if n else 0.0,
+                "Deepfake (n)": n_fake,
+                "Deepfake (%)": round(n_fake / n * 100, 2) if n else 0.0,
+            })
+
+        st.dataframe(
+            comparison,
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.divider()
 
 def render_admin_gate():
     """Password-gated researcher panel. The password lives in secrets, never in the URL."""
