@@ -146,6 +146,7 @@ def _supabase_client():
 class SupabaseStorage:
     def __init__(self):
         self.client = _supabase_client()
+        self.bucket = st.secrets["supabase"].get("bucket", "videos")
 
     def counts(self) -> dict:
         res = self.client.table("counts").select("grp, n").execute()
@@ -162,6 +163,14 @@ class SupabaseStorage:
     def get_stimuli(self) -> list:
         res = self.client.table("stimuli").select("*").order("sort_order").execute()
         return res.data or []
+
+    def signed_url(self, path: str, expires: int = 7200) -> str:
+        """Time-limited URL for an object in a PRIVATE bucket (service_role signs it)."""
+        r = self.client.storage.from_(self.bucket).create_signed_url(path, expires)
+        url = r.get("signedURL") or r.get("signedUrl") or r.get("signed_url")
+        if url and url.startswith("/"):
+            url = st.secrets["supabase"]["url"].rstrip("/") + url
+        return url
 
     def save_response(self, row: dict):
         data = {h: str(row.get(h, "")) for h in RESPONSE_HEADERS}
