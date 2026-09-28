@@ -600,10 +600,10 @@ def screen_demographics():
         age = st.radio("1.1 Qual é a sua faixa etária? *",
                        ["<18", "18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
         gender = st.radio("1.2 Com qual gênero você se identifica?",
-                          ["Feminino", "Masculino", "Outro", "Prefiro não responder"], index=None)
-        education = st.radio("1.3 Nível de escolaridade mais alto já concluído? *",
-                             ["Ensino fundamental", "Ensino médio",
-                              "Ensino superior (graduação)", "Pós-graduação"], index=None)
+                          ["Feminino", "Masculino", "Não-binário", "Agênero / Gênero Fluido", "Prefiro descrever de outra forma", "Prefiro não responder"], index=None)
+        education = st.radio("1.3 Qual seu grau de escolaridade? *",
+                             ["Ensino fundamental incompleto", "Ensino fundamental completo",
+                              "Ensino médio incompleto", "Ensino médio completo", "Ensino técnico ou profissionalizante", "Ensino superior incompleto", "Ensino superior completo", "Pós-graduação"], index=None)
         ai_familiarity = st.radio(
             "1.4 Familiaridade com Inteligência Artificial? *  (1 = Nenhuma … 5 = Especialista)",
             [1, 2, 3, 4, 5], index=None, horizontal=True)
