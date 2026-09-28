@@ -59,9 +59,11 @@ GROUPS_WITH_AI_EXPLANATION = {"XAI", "Todos"}
 # Researcher-only preview options. "Todos" enables every group-specific feature.
 DEBUG_GROUP_OPTIONS = ["Normal", "Controle", "Checklist", "XAI", "Todos"]
 
-# Demographic variables kept balanced across groups (minimization). Fewer factors
-# => stronger balance on each. Must be collected BEFORE assignment (Section 1).
-BALANCE_FACTORS = ["ai_familiarity", "deepfake_knowledge", "education", "age_range"]
+# Demographic variables kept balanced across groups (minimization). All Section 1
+# questions are considered. Optional ones (gender, social_media_freq, used_ai) are
+# skipped per-participant when left blank. Must be collected BEFORE assignment.
+BALANCE_FACTORS = ["age_range", "gender", "education", "ai_familiarity",
+                   "deepfake_knowledge", "social_media_freq", "used_ai"]
 
 LABEL_AUTENTICO = "Legítimo"
 LABEL_DEEPFAKE = "Deepfake"
@@ -363,35 +365,35 @@ def load_stimuli():
 # CERTIFICATE  (generated on the fly; the participant's NAME is never stored)
 # =============================================================================
 
-def verification_code(session_id: str) -> str:
-    """TK_ + first 16 hex chars of the session id (uppercase). Deterministic, so a
-    researcher can match a certificate back to responses.participant_id."""
-    hexchars = re.sub(r"[^0-9a-fA-F]", "", str(session_id)).upper()
-    return "TK_" + (hexchars[:16] or "0000000000000000")
-
-
 def _emitido_em() -> str:
     now = datetime.now(ZoneInfo("America/Sao_Paulo")) if ZoneInfo else datetime.now()
     return now.strftime("%d/%m/%Y")
 
 
-def build_certificate_pdf(name: str, session_id: str) -> bytes:
+def _ano() -> str:
+    now = datetime.now(ZoneInfo("America/Sao_Paulo")) if ZoneInfo else datetime.now()
+    return str(now.year)
+
+
+def _slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", (name or "").strip()).strip("-").lower()
+    return s[:40] or "participacao"
+
+
+def build_certificate_pdf(name: str) -> bytes:
     """Build the participation certificate PDF in memory and return its bytes.
     Requires reportlab (raises ImportError if unavailable)."""
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.lib.colors import HexColor
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER
     from reportlab.pdfgen import canvas
     from reportlab.platypus import Paragraph
-    from reportlab.graphics.barcode.qr import QrCodeWidget
-    from reportlab.graphics.shapes import Drawing
-    from reportlab.graphics import renderPDF
 
     navy = HexColor("#17357e")
     gray = HexColor("#3a3a3a")
-    code = verification_code(session_id)
+    ano = _ano()
 
     buf = io.BytesIO()
     W, H = A4
@@ -417,55 +419,61 @@ def build_certificate_pdf(name: str, session_id: str) -> bytes:
         return h
 
     cx = W / 2.0
-    content_w = W - 60 * mm
-    y = H - 40 * mm
+    content_w = W - 50 * mm
+    y = H - 30 * mm
 
-    y -= draw_centered(para("CERTIFICADO", 34, navy, bold=True), cx, y, content_w)
-    y -= 3 * mm
-    y -= draw_centered(para("Declaração de Participação", 14, gray), cx, y, content_w)
+    y -= draw_centered(para("CERTIFICADO", 32, navy, bold=True), cx, y, content_w)
+    y -= 2 * mm
+    y -= draw_centered(para("Declaração de Participação", 13, gray), cx, y, content_w)
 
-    y -= 34 * mm
-    y -= draw_centered(para("Certificamos que", 12.5, gray), cx, y, content_w)
-    y -= 6 * mm
-    y -= draw_centered(para((name or "Participante").strip(), 26, navy, bold=True),
+    y -= 16 * mm
+    y -= draw_centered(para("Certificamos que", 12, gray), cx, y, content_w)
+    y -= 5 * mm
+    y -= draw_centered(para((name or "Participante").strip(), 24, navy, bold=True),
                        cx, y, content_w)
 
-    y -= 12 * mm
-    body = (f'participou da pesquisa <b>“{CERT_STUDY_TITLE}”</b>, contribuindo '
-            f'voluntariamente para o estudo sobre letramento digital e o uso de '
-            f'explicações de inteligência artificial na identificação de vídeos '
-            f'faciais autênticos ou manipulados (<i>deepfakes</i>).')
-    y -= draw_centered(para(body, 12.5, gray, leading=19), cx, y, content_w)
+    y -= 9 * mm
+    body = (
+        f'participou, na condição de <b>voluntário(a)</b>, da pesquisa intitulada '
+        f'<b>“{CERT_STUDY_TITLE}”</b>, durante o ano de <b>{ano}</b>, contribuindo '
+        f'para o desenvolvimento das atividades previstas no projeto.'
+    )
+    y -= draw_centered(para(body, 12, gray, leading=18), cx, y, content_w)
+
+    y -= 5 * mm
+    body2 = (
+        f'A participação é válida para o <b>ano letivo de {ano}</b> e corresponde a '
+        f'<b>5 (cinco) pontos para fins de Atividades Complementares, no Grupo 2</b>, '
+        f'conforme regulamentação institucional vigente.'
+    )
+    y -= draw_centered(para(body2, 12, gray, leading=18), cx, y, content_w)
 
     y -= 8 * mm
-    proj = (f'O projeto <b>ITT-Vision</b> é uma iniciativa de pesquisa vinculada à '
-            f'<b>{CERT_INSTITUTION}</b>.')
-    y -= draw_centered(para(proj, 12, gray, leading=18), cx, y, content_w)
+    y -= draw_centered(para("<b>Responsáveis pela pesquisa:</b>", 11.5, gray), cx, y, content_w)
+    y -= 1.5 * mm
+    y -= draw_centered(para("<b>Prof. Dr. Rogério Pozza</b> – Orientador/UTFPR-CP",
+                            11.5, gray), cx, y, content_w)
+    y -= 1 * mm
+    y -= draw_centered(para("<b>Prof. Dr. Robson Bonidia</b> – Co-Orientador/UTFPR-CP",
+                            11.5, gray), cx, y, content_w)
 
     y -= 7 * mm
+    y -= draw_centered(
+        para("Por ser verdade, firmamos o presente certificado para os devidos fins.",
+             11.5, gray), cx, y, content_w)
+
+    y -= 6 * mm
     y -= draw_centered(para(f"Emitido em {_emitido_em()}", 10.5, gray), cx, y, content_w)
 
-    # seal (bottom-left)
+    # seal (centered near the bottom)
     if os.path.exists(SEAL_PATH):
         try:
-            c.drawImage(SEAL_PATH, 26 * mm, 26 * mm, width=34 * mm, height=34 * mm,
+            seal_w = 32 * mm
+            c.drawImage(SEAL_PATH, cx - seal_w / 2.0, 22 * mm,
+                        width=seal_w, height=seal_w,
                         mask="auto", preserveAspectRatio=True)
         except Exception:
             pass
-
-    # QR (bottom-right) — encodes the verification code
-    qr = QrCodeWidget(code)
-    qr_size = 34 * mm
-    b = qr.getBounds()
-    scale = qr_size / (b[2] - b[0])
-    d = Drawing(qr_size, qr_size, transform=[scale, 0, 0, scale, 0, 0])
-    d.add(qr)
-    renderPDF.draw(d, c, W - 26 * mm - qr_size, 30 * mm)
-
-    # verification code line
-    p = para(f"Código de verificação: {code}", 9.5, gray, align=TA_RIGHT)
-    w, h = p.wrapOn(c, W - 52 * mm, H)
-    p.drawOn(c, W - 26 * mm - w, 22 * mm)
 
     c.showPage()
     c.save()
@@ -489,8 +497,8 @@ def _certificate_block():
             st.error("Digite seu nome para gerar o certificado.")
         else:
             try:
-                ss.cert_bytes = build_certificate_pdf(name, ss.pid)
-                ss.cert_code = verification_code(ss.pid)
+                ss.cert_bytes = build_certificate_pdf(name)
+                ss.cert_file = f"certificado_{_slug(name)}.pdf"
             except ImportError:
                 st.error("A geração de certificado requer a biblioteca 'reportlab'. "
                          "Adicione 'reportlab' ao requirements.txt.")
@@ -502,11 +510,10 @@ def _certificate_block():
         st.download_button(
             "⬇️ Baixar certificado (PDF)",
             data=ss.cert_bytes,
-            file_name=f"certificado_{ss.get('cert_code', 'participacao')}.pdf",
+            file_name=ss.get("cert_file", "certificado.pdf"),
             mime="application/pdf",
             type="primary",
         )
-        st.caption(f"Código de verificação: {ss.get('cert_code', '')}")
 
 
 # =============================================================================
