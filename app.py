@@ -62,7 +62,7 @@ DEBUG_GROUP_OPTIONS = ["Normal", "Controle", "Checklist", "XAI", "Todos"]
 # Demographic variables kept balanced across groups (minimization). All Section 1
 # questions are considered. Optional ones (gender, social_media_freq, used_ai) are
 # skipped per-participant when left blank. Must be collected BEFORE assignment.
-BALANCE_FACTORS = ["age_range", "gender", "education", "ai_familiarity",
+BALANCE_FACTORS = ["age_range", "gender", "ethnicity", "education", "ai_familiarity",
                    "deepfake_knowledge", "social_media_freq", "used_ai"]
 
 LABEL_AUTENTICO = "Legítimo"
@@ -72,7 +72,7 @@ TASK_OPTIONS = [LABEL_AUTENTICO, LABEL_DEEPFAKE]
 # Fields stored per participant. Note: "group" maps to DB column "grp".
 RESPONSE_HEADERS = [
     "timestamp", "participant_id", "group", "consented",
-    "age_range", "gender", "education",
+    "age_range", "gender", "ethnicity", "education",
     "ai_familiarity", "deepfake_knowledge", "social_media_freq", "used_ai",
     "check_2_1", "check_2_2", "check_2_3", "check_score",
     "task_json", "task_timings_json", "task_score", "final_json", "complete",
@@ -133,7 +133,7 @@ CERT_INSTITUTION = ("Universidade Tecnológica Federal do Paraná (UTFPR) "
                     "– Campus Cornélio Procópio")
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 SEAL_PATH = os.path.join(_ASSETS, "selobg.png")            # transparent InteliGente seal
-WATERMARK_PATH = os.path.join(_ASSETS, "logo.png")      # faint centered watermark
+WATERMARK_PATH = os.path.join(_ASSETS, "logo_wm.png")      # faint centered watermark
 
 # =============================================================================
 # ASSIGNMENT HELPERS (used by the local SQLite fallback)
@@ -408,21 +408,8 @@ def build_certificate_pdf(name: str) -> bytes:
         try:
             wm_w = 130 * mm
             wm_h = wm_w * 992.0 / 1403.0   # logo.png aspect ratio
-    
-            c.saveState()
-            c.setFillAlpha(0.07)
-            c.setStrokeAlpha(0.07)
-    
-            c.drawImage(
-                WATERMARK_PATH,
-                cx - wm_w / 2.0,
-                H / 2.0 - wm_h / 2.0,
-                width=wm_w,
-                height=wm_h,
-                mask="auto"
-            )
-    
-            c.restoreState()
+            c.drawImage(WATERMARK_PATH, cx - wm_w / 2.0, H / 2.0 - wm_h / 2.0,
+                        width=wm_w, height=wm_h, mask="auto")
         except Exception:
             pass
 
@@ -637,30 +624,34 @@ def screen_demographics():
                        ["<18", "18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
         gender = st.radio("1.2 Com qual gênero você se identifica?",
                           ["Feminino", "Masculino", "Não-binário", "Agênero / Gênero Fluido", "Prefiro descrever de outra forma", "Prefiro não responder"], index=None)
-        education = st.radio("1.3 Qual seu grau de escolaridade? *",
+        ethnicity = st.radio("1.3 Com qual cor/raça/etnia você se identifica?",
+                             ["Branca", "Preta", "Parda", "Amarela", "Indígena",
+                              "Prefiro não responder"], index=None)
+        education = st.radio("1.4 Qual seu grau de escolaridade? *",
                              ["Ensino fundamental incompleto", "Ensino fundamental completo",
                               "Ensino médio incompleto", "Ensino médio completo", "Ensino técnico ou profissionalizante", "Ensino superior incompleto", "Ensino superior completo", "Pós-graduação"], index=None)
         ai_familiarity = st.radio(
-            "1.4 Familiaridade com Inteligência Artificial? *  (1 = Nenhuma … 5 = Especialista)",
+            "1.5 Familiaridade com Inteligência Artificial? *  (1 = Nenhuma … 5 = Especialista)",
             [1, 2, 3, 4, 5], index=None, horizontal=True)
-        deepfake_knowledge = st.radio("1.5 Conhecimento prévio sobre *deepfakes*? *",
+        deepfake_knowledge = st.radio("1.6 Conhecimento prévio sobre *deepfakes*? *",
                                       ["Nenhum", "Algum", "Bastante"], index=None)
-        social_media_freq = st.radio("1.6 Com que frequência você usa redes sociais?",
+        social_media_freq = st.radio("1.7 Com que frequência você usa redes sociais?",
                                      ["Raramente", "Semanalmente", "Diariamente", "Várias vezes ao dia"],
                                      index=None)
-        used_ai = st.radio("1.7 Você já usou alguma ferramenta baseada em IA?",
+        used_ai = st.radio("1.8 Você já usou alguma ferramenta baseada em IA?",
                            ["Sim", "Não"], index=None)
         submit = st.form_submit_button("Continuar", type="primary")
 
     if submit:
-        missing = [q for q, v in [("1.1", age), ("1.3", education),
-                                  ("1.4", ai_familiarity), ("1.5", deepfake_knowledge)] if v is None]
+        missing = [q for q, v in [("1.1", age), ("1.4", education),
+                                  ("1.5", ai_familiarity), ("1.6", deepfake_knowledge)] if v is None]
         if missing:
             st.error("Responda às perguntas obrigatórias: " + ", ".join(missing))
         else:
             st.session_state.data.update({
-                "age_range": age, "gender": gender, "education": education,
-                "ai_familiarity": ai_familiarity, "deepfake_knowledge": deepfake_knowledge,
+                "age_range": age, "gender": gender, "ethnicity": ethnicity,
+                "education": education, "ai_familiarity": ai_familiarity,
+                "deepfake_knowledge": deepfake_knowledge,
                 "social_media_freq": social_media_freq, "used_ai": used_ai,
             })
             # Assign AFTER demographics so the groups stay balanced on them.
