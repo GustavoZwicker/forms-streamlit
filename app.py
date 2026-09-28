@@ -12,6 +12,7 @@ Flow:
   intro -> consent (TCLE) -> [GROUP ASSIGNMENT] -> demographics
         -> (Checklist) training -> (Checklist) learning check
         -> classification task (videos from Supabase Storage) -> final -> end
+        -> optional participation certificate (name NOT stored)
 
 Assignment: a single Postgres function (assign_group) picks the group furthest
 below its target proportion and increments its count inside one transaction
@@ -27,16 +28,22 @@ Storage & media (Supabase):
 NOTE: participant-facing text is Portuguese on purpose; the code is English.
 """
 
-import collections
+import io
 import json
+import os
 import random
+import re
 import sqlite3
 import threading
-import time
 import uuid
 from datetime import datetime, timezone
 
 import streamlit as st
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover
+    ZoneInfo = None
 
 # =============================================================================
 # CONFIGURATION
@@ -45,27 +52,21 @@ import streamlit as st
 GROUPS = ["Controle", "Checklist", "XAI"]
 WEIGHTS = {"Controle": 1, "Checklist": 1, "XAI": 1}  # 1:1:1 => same-size samples
 
-GROUPS_WITH_MATERIAL = {"Checklist", "Todos"}
-GROUPS_WITH_AI_EXPLANATION = {"XAI", "Todos"}
-
-# Researcher-only preview options. "Todos" enables every group-specific feature.
-DEBUG_GROUP_OPTIONS = ["Normal", "Controle", "Checklist", "XAI", "Todos"]
-
-# Demographic variables kept balanced across groups (minimization). Fewer factors
-# => stronger balance on each. Must be collected BEFORE assignment (Section 1).
-BALANCE_FACTORS = ["ai_familiarity", "deepfake_knowledge", "education", "age_range"]
+GROUPS_WITH_MATERIAL = {"Checklist"}
+GROUPS_WITH_AI_EXPLANATION = {"XAI"}
 
 LABEL_AUTENTICO = "Legítimo"
 LABEL_DEEPFAKE = "Deepfake"
 TASK_OPTIONS = [LABEL_AUTENTICO, LABEL_DEEPFAKE]
 
 # Fields stored per participant. Note: "group" maps to DB column "grp".
+# The participant's NAME is intentionally NOT in this list — it is never stored.
 RESPONSE_HEADERS = [
     "timestamp", "participant_id", "group", "consented",
     "age_range", "gender", "education",
     "ai_familiarity", "deepfake_knowledge", "social_media_freq", "used_ai",
     "check_2_1", "check_2_2", "check_2_3", "check_score",
-    "task_json", "task_timings_json", "task_score", "final_json", "complete",
+    "task_json", "task_score", "final_json", "complete",
 ]
 
 # Section 2 answer key (NOT shown to the participant).
@@ -85,6 +86,14 @@ OPTIONS_2_3 = [
     "Aumentar o brilho da tela",
     "Compartilhar antes de checar",
 ]
+
+# -----------------------------------------------------------------------------
+# Certificate (participant-facing). Adjust the study/institution text if needed.
+# -----------------------------------------------------------------------------
+CERT_STUDY_TITLE = "ITT-Vision: identificação de vídeos autênticos e deepfakes"
+CERT_INSTITUTION = ("Universidade Tecnológica Federal do Paraná (UTFPR) "
+                    "– Campus Cornélio Procópio")
+SEAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "seal.png")
 
 # -----------------------------------------------------------------------------
 # Consent text (Portuguese). Fill in the bracketed fields before collecting data.
@@ -155,54 +164,27 @@ def _supabase_client():
 class SupabaseStorage:
     def __init__(self):
         self.client = _supabase_client()
-        self.bucket = st.secrets["supabase"].get("bucket", "videos")
 
     def counts(self) -> dict:
         res = self.client.table("counts").select("grp, n").execute()
         return {r["grp"]: int(r["n"]) for r in (res.data or [])}
 
-    def assign_group(self, factors=None) -> str:
-        # Atomic + race-free: minimization runs inside the Postgres function.
-        res = self.client.rpc("assign_group_min", {"p_factors": factors or {}}).execute()
+    def assign_group(self) -> str:
+        # Atomic + race-free: all logic lives in the Postgres function.
+        res = self.client.rpc("assign_group", {}).execute()
         data = res.data
         if isinstance(data, list):
             data = data[0] if data else None
         return data
 
-    def strata(self) -> list:
-        res = self.client.table("strata_counts").select("*").execute()
-        return res.data or []
-
     def get_stimuli(self) -> list:
         res = self.client.table("stimuli").select("*").order("sort_order").execute()
         return res.data or []
-
-    def signed_url(self, path: str, expires: int = 7200) -> str:
-        """Time-limited URL for an object in a PRIVATE bucket (service_role signs it)."""
-        r = self.client.storage.from_(self.bucket).create_signed_url(path, expires)
-        url = r.get("signedURL") or r.get("signedUrl") or r.get("signed_url")
-        if url and url.startswith("/"):
-            url = st.secrets["supabase"]["url"].rstrip("/") + url
-        return url
 
     def save_response(self, row: dict):
         data = {h: str(row.get(h, "")) for h in RESPONSE_HEADERS}
         data["grp"] = data.pop("group")  # DB column is "grp"
         self.client.table("responses").insert(data).execute()
-
-    def get_responses(self) -> list:
-        """Return completed participant responses for the researcher dashboard."""
-        res = (
-            self.client
-            .table("responses")
-            .select(
-                "participant_id, grp, task_json, task_score, "
-                "complete, timestamp"
-            )
-            .eq("complete", "Sim")
-            .execute()
-        )
-        return res.data or []
 
 
 class SQLiteStorage:
@@ -221,16 +203,13 @@ class SQLiteStorage:
     def counts(self) -> dict:
         return {g: n for g, n in self.conn.execute("SELECT grp, n FROM counts")}
 
-    def assign_group(self, factors=None) -> str:
+    def assign_group(self) -> str:
         with get_lock():
             counts = self.counts()
             group = choose_group(counts)
             self.conn.execute("UPDATE counts SET n = n + 1 WHERE grp = ?", (group,))
             self.conn.commit()
             return group
-
-    def strata(self) -> list:
-        return []
 
     def get_stimuli(self) -> list:
         return []
@@ -242,19 +221,6 @@ class SQLiteStorage:
             [str(row.get(h, "")) for h in RESPONSE_HEADERS],
         )
         self.conn.commit()
-
-    def get_responses(self) -> list:
-        """Return completed participant responses for the researcher dashboard."""
-        columns = [
-            "participant_id", "group", "task_json", "task_score",
-            "complete", "timestamp"
-        ]
-        rows = self.conn.execute(
-            "SELECT participant_id, group, task_json, task_score, "
-            "complete, timestamp FROM responses WHERE complete = ?",
-            ("Sim",)
-        ).fetchall()
-        return [dict(zip(columns, row)) for row in rows]
 
 
 def _has_supabase() -> bool:
@@ -275,27 +241,17 @@ def get_storage():
 # VIDEO / STIMULI HELPERS
 # =============================================================================
 
-@st.cache_data(show_spinner=False, ttl=3000)
-def _signed_url(path: str):
-    storage, _ = get_storage()
-    try:
-        return storage.signed_url(path)
-    except Exception:
-        return None
-
-
 def video_url(video_value: str):
-    """A time-limited signed Storage URL (works with a PRIVATE bucket), or the
-    value itself if it is already a full URL."""
+    """Full URL for a stimulus: a public Storage URL from the filename, or the
+    value itself if it is already a URL."""
     v = str(video_value).strip()
     if not v:
         return None
     if v.startswith("http://") or v.startswith("https://"):
         return v
-    storage, mode = get_storage()
-    if mode != "supabase":
-        return None
-    return _signed_url(v)
+    base = st.secrets["supabase"]["url"].rstrip("/")
+    bucket = st.secrets["supabase"].get("bucket", "videos")
+    return f"{base}/storage/v1/object/public/{bucket}/{v}"
 
 
 def parse_prob(value):
@@ -344,6 +300,119 @@ def load_stimuli():
 
 
 # =============================================================================
+# CERTIFICATE  (generated on the fly; the participant's NAME is never stored)
+# =============================================================================
+
+def verification_code(session_id: str) -> str:
+    """TK_ + first 16 hex chars of the session id (uppercase). Deterministic, so a
+    researcher can match a certificate back to responses.participant_id."""
+    hexchars = re.sub(r"[^0-9a-fA-F]", "", str(session_id)).upper()
+    return "TK_" + (hexchars[:16] or "0000000000000000")
+
+
+def _emitido_em() -> str:
+    now = datetime.now(ZoneInfo("America/Sao_Paulo")) if ZoneInfo else datetime.now()
+    return now.strftime("%d/%m/%Y")
+
+
+def build_certificate_pdf(name: str, session_id: str) -> bytes:
+    """Build the participation certificate PDF in memory and return its bytes.
+    Requires reportlab (raises ImportError if unavailable)."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.pdfgen import canvas
+    from reportlab.platypus import Paragraph
+    from reportlab.graphics.barcode.qr import QrCodeWidget
+    from reportlab.graphics.shapes import Drawing
+    from reportlab.graphics import renderPDF
+
+    navy = HexColor("#17357e")
+    gray = HexColor("#3a3a3a")
+    code = verification_code(session_id)
+
+    buf = io.BytesIO()
+    W, H = A4
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    # double border
+    c.setStrokeColor(navy)
+    c.setLineWidth(3)
+    c.rect(12 * mm, 12 * mm, W - 24 * mm, H - 24 * mm)
+    c.setLineWidth(1)
+    c.rect(14 * mm, 14 * mm, W - 28 * mm, H - 28 * mm)
+
+    def para(text, size, color, leading=None, bold=False, align=TA_CENTER):
+        style = ParagraphStyle(
+            "s", fontName=("Times-Bold" if bold else "Times-Roman"),
+            fontSize=size, leading=leading or size * 1.35,
+            textColor=color, alignment=align)
+        return Paragraph(text, style)
+
+    def draw_centered(p, cx, top_y, max_w):
+        w, h = p.wrapOn(c, max_w, H)
+        p.drawOn(c, cx - w / 2.0, top_y - h)
+        return h
+
+    cx = W / 2.0
+    content_w = W - 60 * mm
+    y = H - 40 * mm
+
+    y -= draw_centered(para("CERTIFICADO", 34, navy, bold=True), cx, y, content_w)
+    y -= 3 * mm
+    y -= draw_centered(para("Declaração de Participação", 14, gray), cx, y, content_w)
+
+    y -= 34 * mm
+    y -= draw_centered(para("Certificamos que", 12.5, gray), cx, y, content_w)
+    y -= 6 * mm
+    y -= draw_centered(para((name or "Participante").strip(), 26, navy, bold=True),
+                       cx, y, content_w)
+
+    y -= 12 * mm
+    body = (f'participou da pesquisa <b>“{CERT_STUDY_TITLE}”</b>, contribuindo '
+            f'voluntariamente para o estudo sobre letramento digital e o uso de '
+            f'explicações de inteligência artificial na identificação de vídeos '
+            f'faciais autênticos ou manipulados (<i>deepfakes</i>).')
+    y -= draw_centered(para(body, 12.5, gray, leading=19), cx, y, content_w)
+
+    y -= 8 * mm
+    proj = (f'O projeto <b>ITT-Vision</b> é uma iniciativa de pesquisa vinculada à '
+            f'<b>{CERT_INSTITUTION}</b>.')
+    y -= draw_centered(para(proj, 12, gray, leading=18), cx, y, content_w)
+
+    y -= 7 * mm
+    y -= draw_centered(para(f"Emitido em {_emitido_em()}", 10.5, gray), cx, y, content_w)
+
+    # seal (bottom-left)
+    if os.path.exists(SEAL_PATH):
+        try:
+            c.drawImage(SEAL_PATH, 26 * mm, 26 * mm, width=34 * mm, height=34 * mm,
+                        mask="auto", preserveAspectRatio=True)
+        except Exception:
+            pass
+
+    # QR (bottom-right) — encodes the verification code
+    qr = QrCodeWidget(code)
+    qr_size = 34 * mm
+    b = qr.getBounds()
+    scale = qr_size / (b[2] - b[0])
+    d = Drawing(qr_size, qr_size, transform=[scale, 0, 0, scale, 0, 0])
+    d.add(qr)
+    renderPDF.draw(d, c, W - 26 * mm - qr_size, 30 * mm)
+
+    # verification code line
+    p = para(f"Código de verificação: {code}", 9.5, gray, align=TA_RIGHT)
+    w, h = p.wrapOn(c, W - 52 * mm, H)
+    p.drawOn(c, W - 26 * mm - w, 22 * mm)
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+# =============================================================================
 # STATE AND NAVIGATION
 # =============================================================================
 
@@ -354,11 +423,6 @@ def init_state():
     ss.setdefault("group", None)
     ss.setdefault("data", {})
     ss.setdefault("saved", False)
-    # Per-video task state: one video is shown and submitted at a time.
-    ss.setdefault("task_index", 0)
-    ss.setdefault("task_started_at", None)
-    ss.setdefault("task_answers", {})
-    ss.setdefault("task_timings", {})
 
 
 def go_to(step):
@@ -366,20 +430,8 @@ def go_to(step):
     st.rerun()
 
 
-def effective_group():
-    """Return the group whose features should be active in this session.
-
-    The researcher can temporarily override the assigned group from the admin
-    panel. The override is session-local and does not affect database assignment.
-    """
-    debug_group = st.session_state.get("debug_group", "Normal")
-    if debug_group != "Normal":
-        return debug_group
-    return st.session_state.get("group")
-
-
 def next_after_demographics():
-    return "material" if effective_group() in GROUPS_WITH_MATERIAL else "task"
+    return "material" if st.session_state.group in GROUPS_WITH_MATERIAL else "task"
 
 
 # =============================================================================
@@ -418,6 +470,9 @@ def screen_consent():
         elif choice.startswith("Não"):
             go_to("declined")
         else:
+            if st.session_state.group is None:  # assign exactly once per session
+                storage, _ = get_storage()
+                st.session_state.group = storage.assign_group()
             st.session_state.data["consented"] = "Sim"
             go_to("demographics")
 
@@ -432,7 +487,7 @@ def screen_demographics():
     st.caption("Campos com * são obrigatórios.")
     with st.form("demographics"):
         age = st.radio("1.1 Qual é a sua faixa etária? *",
-                       ["<18", "18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
+                       ["18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
         gender = st.radio("1.2 Com qual gênero você se identifica?",
                           ["Feminino", "Masculino", "Outro", "Prefiro não responder"], index=None)
         education = st.radio("1.3 Nível de escolaridade mais alto já concluído? *",
@@ -461,13 +516,6 @@ def screen_demographics():
                 "ai_familiarity": ai_familiarity, "deepfake_knowledge": deepfake_knowledge,
                 "social_media_freq": social_media_freq, "used_ai": used_ai,
             })
-            # Assign AFTER demographics so the groups stay balanced on them.
-            if st.session_state.group is None:
-                storage, _ = get_storage()
-                factors = {f: str(st.session_state.data.get(f))
-                           for f in BALANCE_FACTORS
-                           if st.session_state.data.get(f) is not None}
-                st.session_state.group = storage.assign_group(factors)
             go_to(next_after_demographics())
 
 
@@ -526,16 +574,11 @@ def screen_check():
 
 
 def screen_task():
-    """Show one stimulus at a time and collect classification, confidence, and timing."""
-    ss = st.session_state
-    group = effective_group()
+    group = st.session_state.group
     show_ai = group in GROUPS_WITH_AI_EXPLANATION
 
     st.header("Tarefa — assista e classifique os vídeos")
-    st.write(
-        "Assista a cada vídeo e indique se você o considera **legítimo** ou "
-        "**deepfake**. Após a classificação, informe sua confiança."
-    )
+    st.write("Para cada vídeo, indique se você o considera **legítimo** ou **deepfake**.")
 
     stimuli, source = load_stimuli()
     if not stimuli:
@@ -545,114 +588,50 @@ def screen_task():
             "os arquivos para o bucket de Storage."
         )
         return
-
     if source == "test":
         st.caption("〔Modo de teste: vídeos indisponíveis; exibindo apenas a estrutura.〕")
 
-    # Safety check if the session contains an invalid index.
-    if ss.task_index >= len(stimuli):
-        go_to("final")
-        return
+    with st.form("task"):
+        answers, labels = {}, {}
+        for idx, s in enumerate(stimuli, start=1):
+            st.markdown(f"**Vídeo {idx}**")
 
-    idx = ss.task_index
-    stimulus = stimuli[idx]
-    video_number = idx + 1
-    video_key = f"vid_{video_number}"
+            url = video_url(s.get("video", ""))
+            if url:
+                st.video(url)
+            else:
+                st.markdown(
+                    "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
+                    "border-radius:8px;display:flex;align-items:center;justify-content:center;"
+                    f"color:#888'>vídeo {idx}</div>", unsafe_allow_html=True)
 
-    st.progress(video_number / len(stimuli), text=f"Vídeo {video_number} de {len(stimuli)}")
-    st.subheader(f"Vídeo {video_number}")
+            if show_ai:
+                mv = model_verdict(s.get("prob_deepfake"))
+                if mv:
+                    verdict, conf = mv
+                    st.info(f"🔎 **Resultado do modelo de detecção:** {verdict} ({conf:.0%})")
+                explanation = str(s.get("explanation", "")).strip()
+                if explanation:
+                    st.markdown(f"**Explicação da IA:** {explanation}")
 
-    url = video_url(stimulus.get("video", ""))
-    if url:
-        st.video(url)
-    else:
-        st.markdown(
-            "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
-            "border-radius:8px;display:flex;align-items:center;justify-content:center;"
-            f"color:#888'>vídeo {video_number}</div>",
-            unsafe_allow_html=True,
-        )
-
-    if show_ai:
-        mv = model_verdict(stimulus.get("prob_deepfake"))
-        if mv:
-            verdict, model_confidence = mv
-            st.info(
-                f"🔎 **Resultado do modelo de detecção:** "
-                f"{verdict} ({model_confidence:.0%})"
-            )
-
-        explanation = str(stimulus.get("explanation", "")).strip()
-        if explanation:
-            st.markdown(f"**Explicação da IA:** {explanation}")
-
-    # Start the timer once, when this video is first rendered.
-    if ss.task_started_at is None:
-        ss.task_started_at = time.perf_counter()
-
-    with st.form(f"task_video_{video_number}"):
-        answer = st.radio(
-            "Classificação do vídeo *",
-            TASK_OPTIONS,
-            index=None,
-            horizontal=True,
-        )
-        confidence = st.radio(
-            "Qual é o seu nível de confiança nesta classificação? "
-            "(1 = Nada confiante … 5 = Muito confiante) *",
-            [1, 2, 3, 4, 5],
-            index=None,
-            horizontal=True,
-        )
-        submit_label = (
-            "Enviar classificação e avançar"
-            if video_number < len(stimuli)
-            else "Enviar classificação e finalizar tarefa"
-        )
-        submit = st.form_submit_button(submit_label, type="primary")
+            key = f"vid_{idx}"
+            answers[key] = st.radio(f"Classificação do vídeo {idx} *", TASK_OPTIONS,
+                                    index=None, horizontal=True, key=key,
+                                    label_visibility="collapsed")
+            labels[key] = str(s.get("label", "")).strip()
+            st.divider()
+        submit = st.form_submit_button("Continuar", type="primary")
 
     if submit:
-        if answer is None or confidence is None:
-            st.error("Selecione a classificação e o nível de confiança.")
-            return
-
-        elapsed_seconds = round(time.perf_counter() - ss.task_started_at, 3)
-        ground_truth = str(stimulus.get("label", "")).strip()
-
-        ss.task_answers[video_key] = {
-            "answer": answer,
-            "confidence": confidence,
-        }
-        ss.task_timings[video_key] = {
-            "response_time_seconds": elapsed_seconds,
-            "video_number": video_number,
-        }
-
-        if ground_truth:
-            ss.task_answers[video_key]["correct"] = label_matches(
-                ground_truth, answer
-            )
-
-        # Keep the collected values in the existing participant data structure.
-        ss.data["task_json"] = json.dumps(ss.task_answers, ensure_ascii=False)
-        ss.data["task_timings_json"] = json.dumps(
-            ss.task_timings, ensure_ascii=False
-        )
-
-        if all(str(s.get("label", "")).strip() for s in stimuli):
-            ss.data["task_score"] = sum(
-                1
-                for i, s in enumerate(stimuli, start=1)
-                if ss.task_answers.get(f"vid_{i}", {}).get("correct") is True
-            )
-
-        ss.task_index += 1
-        ss.task_started_at = None
-
-        if ss.task_index >= len(stimuli):
-            go_to("final")
+        if any(v is None for v in answers.values()):
+            st.error("Classifique todos os vídeos antes de continuar.")
         else:
-            st.rerun()
+            st.session_state.data["task_json"] = json.dumps(answers, ensure_ascii=False)
+            if all(labels.values()):
+                score = sum(label_matches(labels[k], answers[k]) for k in answers)
+                st.session_state.data["task_score"] = score
+            go_to("final")
+
 
 def screen_final():
     st.header("Questionários finais")
@@ -671,6 +650,43 @@ def screen_final():
             ensure_ascii=False,
         )
         go_to("end")
+
+
+def _certificate_block():
+    """Name field + PDF download. The name is used only to render the certificate
+    in-session and is NEVER added to the response row or saved anywhere."""
+    ss = st.session_state
+    st.divider()
+    st.subheader("Certificado de participação")
+    st.write(
+        "Se desejar, gere um certificado de participação. O nome informado é usado "
+        "**apenas** para gerar o PDF e **não é armazenado** pela pesquisa."
+    )
+    name = st.text_input("Nome completo (como deve aparecer no certificado)",
+                         key="cert_name_input")
+    if st.button("Gerar certificado"):
+        if not name.strip():
+            st.error("Digite seu nome para gerar o certificado.")
+        else:
+            try:
+                ss.cert_bytes = build_certificate_pdf(name, ss.pid)
+                ss.cert_code = verification_code(ss.pid)
+            except ImportError:
+                st.error("A geração de certificado requer a biblioteca 'reportlab'. "
+                         "Adicione 'reportlab' ao requirements.txt.")
+            except Exception as e:  # noqa: BLE001
+                st.error("Não foi possível gerar o certificado.")
+                st.caption(f"Detalhe técnico: {e}")
+
+    if ss.get("cert_bytes"):
+        st.download_button(
+            "⬇️ Baixar certificado (PDF)",
+            data=ss.cert_bytes,
+            file_name=f"certificado_{ss.get('cert_code', 'participacao')}.pdf",
+            mime="application/pdf",
+            type="primary",
+        )
+        st.caption(f"Código de verificação: {ss.get('cert_code', '')}")
 
 
 def screen_end():
@@ -696,73 +712,67 @@ def screen_end():
 
     st.header("Obrigado por participar! ✅")
     st.write("Suas respostas foram registradas de forma anônima.")
-    st.success(f"Grupo atribuído: **{ss.group}**")
-    if ss.get("debug_group", "Normal") != "Normal":
-        st.caption(f"Configuração de depuração aplicada: **{ss.debug_group}**")
+    st.success(f"Você participou do grupo: **{ss.group}**")
     st.caption("Anote esta informação caso precise informá-la à equipe da pesquisa.")
-    st.write("Você pode fechar esta janela.")
-    if ss.get("debug_group", "Normal") != "Normal":
-        st.info(
-            "Modo de depuração ativo: "
-            f"as características exibidas foram **{ss.debug_group}**. "
-            "Essa execução não deve ser usada como resposta de participante."
-        )
+
+    _certificate_block()
+
+
+# =============================================================================
+# ADMIN
+# =============================================================================
+
+def _admin_group_vision():
+    """Show, per stimulus, exactly what each group sees during the task."""
+    st.subheader("Visão por grupo na tarefa de inferência")
+    st.caption("O que cada grupo vê ao classificar cada vídeo. Use para conferência "
+               "(QA) antes da coleta.")
+
+    stimuli, source = load_stimuli()
+    if not stimuli:
+        st.info("Nenhum estímulo configurado (tabela 'stimuli' vazia ou backend local).")
+        return
+    if source == "test":
+        st.caption("〔Backend local: exibindo apenas a estrutura, sem vídeos reais.〕")
+
+    for idx, s in enumerate(stimuli, start=1):
+        gt = str(s.get("label", "")).strip() or "—"
+        mv = model_verdict(s.get("prob_deepfake"))
+        prob = parse_prob(s.get("prob_deepfake"))
+
+        header = f"Vídeo {idx} · rótulo real: {gt}"
+        if mv and gt not in ("—", ""):
+            ok = label_matches(gt, LABEL_DEEPFAKE if mv[0] == "Deepfake" else LABEL_AUTENTICO)
+            header += f" · modelo: {mv[0]} ({mv[1]:.0%}) · {'✅ correto' if ok else '❌ errado'}"
+        with st.expander(header, expanded=False):
+            url = video_url(s.get("video", ""))
+            if url:
+                st.video(url)
+            else:
+                st.caption(f"〔sem vídeo: '{s.get('video','')}'〕")
+            st.caption(f"arquivo: `{s.get('video','')}` · prob_deepfake: "
+                       f"{'' if prob is None else f'{prob:.4f}'}")
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("**Controle**")
+                st.write("Apenas o vídeo. Sem treinamento e sem informação do modelo.")
+            with col2:
+                st.markdown("**Checklist**")
+                st.write("Apenas o vídeo (após o treinamento com checklist). "
+                         "Sem informação do modelo na tarefa.")
+            with col3:
+                st.markdown("**XAI**")
+                if mv:
+                    st.info(f"🔎 Resultado do modelo: {mv[0]} ({mv[1]:.0%})")
+                else:
+                    st.caption("〔sem prob_deepfake〕")
+                expl = str(s.get("explanation", "")).strip()
+                st.markdown(f"**Explicação da IA:** {expl or '〔vazia〕'}")
 
 
 def screen_admin():
-    """Password-protected researcher dashboard."""
     st.header("Researcher panel")
-
-    # -------------------------------------------------------------------------
-    # Researcher-only feature debugging
-    # -------------------------------------------------------------------------
-    st.subheader("Feature debugging / participant preview")
-    st.caption(
-        "Choose which group-specific features should be active in a preview. "
-        "This override is local to the current session and does not change the "
-        "participant's assigned group or the balancing counters."
-    )
-
-    current_debug_group = st.session_state.get("debug_group", "Normal")
-    debug_group = st.selectbox(
-        "Feature configuration",
-        options=DEBUG_GROUP_OPTIONS,
-        index=DEBUG_GROUP_OPTIONS.index(current_debug_group)
-        if current_debug_group in DEBUG_GROUP_OPTIONS else 0,
-        key="admin_debug_group",
-        help=(
-            "Normal uses the assigned group. Todos enables Checklist material, "
-            "the learning check, model probability, and XAI explanation."
-        ),
-    )
-    st.session_state["debug_group"] = debug_group
-
-    debug_features = {
-        "Assigned group used": st.session_state.get("group") or "Not assigned yet",
-        "Active feature group": debug_group,
-        "Checklist material": "Enabled" if debug_group in GROUPS_WITH_MATERIAL else "Disabled",
-        "Learning check": "Enabled" if debug_group in GROUPS_WITH_MATERIAL else "Disabled",
-        "Model probability": "Enabled" if debug_group in GROUPS_WITH_AI_EXPLANATION else "Disabled",
-        "XAI explanation": "Enabled" if debug_group in GROUPS_WITH_AI_EXPLANATION else "Disabled",
-    }
-    st.table([{"Feature": key, "Status": value} for key, value in debug_features.items()])
-
-    if st.button("Launch participant preview", type="primary"):
-        # Start a fresh preview while preserving the selected debug configuration.
-        st.session_state["step"] = "intro"
-        st.session_state["pid"] = "DEBUG-" + str(uuid.uuid4())
-        st.session_state["group"] = None
-        st.session_state["data"] = {}
-        st.session_state["saved"] = False
-        st.session_state["task_index"] = 0
-        st.session_state["task_started_at"] = None
-        st.session_state["task_answers"] = {}
-        st.session_state["task_timings"] = {}
-        st.query_params.clear()
-        st.rerun()
-
-    st.divider()
-
     try:
         storage, mode = get_storage()
         counts = storage.counts()
@@ -770,158 +780,14 @@ def screen_admin():
         st.error(f"Failed to read counts: {e}")
         return
 
-    st.subheader("Participant distribution")
-    metric_cols = st.columns(len(GROUPS))
-    for col, group in zip(metric_cols, GROUPS):
-        col.metric(group, counts.get(group, 0))
+    tab_counts, tab_vision = st.tabs(["Contagens", "Visão por grupo"])
+    with tab_counts:
+        st.metric("Total assigned", sum(counts.values()))
+        st.write({g: counts.get(g, 0) for g in GROUPS})
+        st.caption(f"Backend: {mode} · target weights: {WEIGHTS}")
+    with tab_vision:
+        _admin_group_vision()
 
-    st.metric("Total assigned", sum(counts.values()))
-    st.caption(f"Backend: {mode} · target weights: {WEIGHTS}")
-    st.divider()
-
-    # Demographic balance
-    try:
-        rows = storage.strata() if hasattr(storage, "strata") else []
-    except Exception:
-        rows = []
-
-    if rows:
-        st.subheader("Demographic balance")
-        by_factor = collections.defaultdict(
-            lambda: collections.defaultdict(dict)
-        )
-        for row in rows:
-            by_factor[row["factor"]][str(row["level"])][row["grp"]] = row["n"]
-
-        for factor in sorted(by_factor):
-            st.caption(factor)
-            table = [
-                {
-                    "level": level,
-                    **{group: levels.get(group, 0) for group in GROUPS},
-                }
-                for level, levels in sorted(by_factor[factor].items())
-            ]
-            st.table(table)
-
-    st.divider()
-    st.subheader("Video inference comparison")
-
-    try:
-        responses = storage.get_responses()
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Failed to read participant responses: {e}")
-        return
-
-    if not responses:
-        st.info("No completed participant responses found.")
-        return
-
-    stimuli, _ = load_stimuli()
-    if not stimuli:
-        st.warning("No stimuli configured.")
-        return
-
-    selected_groups = st.multiselect(
-        "Groups to compare",
-        options=GROUPS,
-        default=GROUPS,
-        key="admin_selected_groups",
-    )
-    if not selected_groups:
-        st.info("Select at least one group to compare.")
-        return
-
-    group_answers = {
-        group: collections.defaultdict(list)
-        for group in GROUPS
-    }
-
-    for response in responses:
-        group = response.get("grp") or response.get("group")
-        if group not in GROUPS:
-            continue
-
-        try:
-            task = json.loads(response.get("task_json") or "{}")
-        except (TypeError, json.JSONDecodeError):
-            continue
-
-        if not isinstance(task, dict):
-            continue
-
-        for video_key, answer_data in task.items():
-            # New format: {"answer": "...", "confidence": 1, ...}
-            if isinstance(answer_data, dict):
-                answer = answer_data.get("answer")
-            else:
-                # Backward compatibility with responses from the old app.
-                answer = answer_data
-
-            if answer in TASK_OPTIONS:
-                group_answers[group][video_key].append(answer)
-
-    show_videos = st.checkbox(
-        "Show videos in the Admin panel",
-        value=True,
-        key="admin_show_videos",
-    )
-    show_researcher_info = st.checkbox(
-        "Show ground truth, model probability, and XAI explanation",
-        value=True,
-        key="admin_show_researcher_info",
-    )
-
-    st.caption(
-        "Percentages use submitted answers for each video and group. "
-        "Missing answers are excluded."
-    )
-
-    for idx, stimulus in enumerate(stimuli, start=1):
-        video_key = f"vid_{idx}"
-        st.markdown(f"## Video {idx}")
-
-        if show_videos:
-            url = video_url(stimulus.get("video", ""))
-            if url:
-                st.video(url)
-            else:
-                st.warning("Video unavailable for this stimulus.")
-
-        if show_researcher_info:
-            with st.expander("Researcher information", expanded=False):
-                st.write("Ground truth:", stimulus.get("label", ""))
-                st.write(
-                    "Model deepfake probability:",
-                    stimulus.get("prob_deepfake", ""),
-                )
-                explanation = str(stimulus.get("explanation", "")).strip()
-                if explanation:
-                    st.markdown("**XAI explanation:**")
-                    st.write(explanation)
-
-        comparison = []
-        for group in selected_groups:
-            answers = group_answers[group][video_key]
-            n = len(answers)
-            n_real = answers.count(LABEL_AUTENTICO)
-            n_fake = answers.count(LABEL_DEEPFAKE)
-
-            comparison.append({
-                "Group": group,
-                "Responses": n,
-                "Legitimate (n)": n_real,
-                "Legitimate (%)": round(n_real / n * 100, 2) if n else 0.0,
-                "Deepfake (n)": n_fake,
-                "Deepfake (%)": round(n_fake / n * 100, 2) if n else 0.0,
-            })
-
-        st.dataframe(
-            comparison,
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.divider()
 
 def render_admin_gate():
     """Password-gated researcher panel. The password lives in secrets, never in the URL."""
