@@ -408,8 +408,21 @@ def build_certificate_pdf(name: str) -> bytes:
         try:
             wm_w = 130 * mm
             wm_h = wm_w * 992.0 / 1403.0   # logo.png aspect ratio
-            c.drawImage(WATERMARK_PATH, cx - wm_w / 2.0, H / 2.0 - wm_h / 2.0,
-                        width=wm_w, height=wm_h, mask="auto")
+    
+            c.saveState()
+            c.setFillAlpha(0.07)
+            c.setStrokeAlpha(0.07)
+    
+            c.drawImage(
+                WATERMARK_PATH,
+                cx - wm_w / 2.0,
+                H / 2.0 - wm_h / 2.0,
+                width=wm_w,
+                height=wm_h,
+                mask="auto"
+            )
+    
+            c.restoreState()
         except Exception:
             pass
 
