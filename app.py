@@ -547,6 +547,7 @@ def init_state():
     ss.setdefault("task_started_at", None)
     ss.setdefault("task_answers", {})
     ss.setdefault("task_timings", {})
+    ss.setdefault("task_order", None)  # per-participant randomized video order
 
 
 def go_to(step):
@@ -776,13 +777,22 @@ def screen_task():
         go_to("final")
         return
 
-    idx = ss.task_index
-    stimulus = stimuli[idx]
-    video_number = idx + 1
+    # Random per-participant order (controls for order effects). The video KEY
+    # stays tied to the stimulus's sort_order position, so answers remain
+    # comparable across participants and the admin/score logic keeps working.
+    if not ss.task_order or len(ss.task_order) != len(stimuli):
+        order = list(range(len(stimuli)))
+        random.shuffle(order)
+        ss.task_order = order
+
+    pos = ss.task_index                 # 0-based display position (what the person sees)
+    real_idx = ss.task_order[pos]       # index into the sort_order stimuli list
+    stimulus = stimuli[real_idx]
+    video_number = real_idx + 1         # STABLE id (sort_order position) -> stable key
     video_key = f"vid_{video_number}"
 
-    st.progress(video_number / len(stimuli), text=f"Vídeo {video_number} de {len(stimuli)}")
-    st.subheader(f"Vídeo {video_number}")
+    st.progress((pos + 1) / len(stimuli), text=f"Vídeo {pos + 1} de {len(stimuli)}")
+    st.subheader(f"Vídeo {pos + 1}")
 
     url = video_url(stimulus.get("video", ""))
     if url:
@@ -791,7 +801,7 @@ def screen_task():
         st.markdown(
             "<div style='width:100%;max-width:480px;height:240px;background:#eee;"
             "border-radius:8px;display:flex;align-items:center;justify-content:center;"
-            f"color:#888'>vídeo {video_number}</div>",
+            f"color:#888'>vídeo {pos + 1}</div>",
             unsafe_allow_html=True,
         )
 
@@ -828,7 +838,7 @@ def screen_task():
         )
         submit_label = (
             "Enviar classificação e avançar"
-            if video_number < len(stimuli)
+            if pos + 1 < len(stimuli)
             else "Enviar classificação e finalizar tarefa"
         )
         submit = st.form_submit_button(submit_label, type="primary")
@@ -847,7 +857,8 @@ def screen_task():
         }
         ss.task_timings[video_key] = {
             "response_time_seconds": elapsed_seconds,
-            "video_number": video_number,
+            "video_number": video_number,      # stable id (sort_order position)
+            "display_position": pos + 1,        # where it appeared for this participant
         }
 
         if ground_truth:
@@ -982,6 +993,7 @@ def screen_admin():
         st.session_state["task_started_at"] = None
         st.session_state["task_answers"] = {}
         st.session_state["task_timings"] = {}
+        st.session_state["task_order"] = None
         st.query_params.clear()
         st.rerun()
 
