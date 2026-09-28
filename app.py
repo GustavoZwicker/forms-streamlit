@@ -133,7 +133,7 @@ CERT_INSTITUTION = ("Universidade Tecnológica Federal do Paraná (UTFPR) "
                     "– Campus Cornélio Procópio")
 _ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 SEAL_PATH = os.path.join(_ASSETS, "selobg.png")            # transparent InteliGente seal
-WATERMARK_PATH = os.path.join(_ASSETS, "logo_wm.png")      # faint centered watermark
+WATERMARK_PATH = os.path.join(_ASSETS, "logo.png")      # faint centered watermark
 
 # =============================================================================
 # ASSIGNMENT HELPERS (used by the local SQLite fallback)
