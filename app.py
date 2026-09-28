@@ -131,7 +131,9 @@ sob orientação de Rogério Pozza e Robson Bonidia.
 CERT_STUDY_TITLE = "ITT-Vision: identificação de vídeos autênticos e deepfakes"
 CERT_INSTITUTION = ("Universidade Tecnológica Federal do Paraná (UTFPR) "
                     "– Campus Cornélio Procópio")
-SEAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "seal.png")
+_ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+SEAL_PATH = os.path.join(_ASSETS, "selobg.png")            # transparent InteliGente seal
+WATERMARK_PATH = os.path.join(_ASSETS, "logo_wm.png")      # faint centered watermark
 
 # =============================================================================
 # ASSIGNMENT HELPERS (used by the local SQLite fallback)
@@ -391,20 +393,30 @@ def build_certificate_pdf(name: str) -> bytes:
     from reportlab.pdfgen import canvas
     from reportlab.platypus import Paragraph
 
-    navy = HexColor("#17357e")
-    gray = HexColor("#3a3a3a")
+    navy = HexColor("#1e3a8a")       # InteliGente blue
+    gray = HexColor("#374151")
+    name_dark = HexColor("#111827")
     ano = _ano()
 
     buf = io.BytesIO()
     W, H = A4
+    cx = W / 2.0
     c = canvas.Canvas(buf, pagesize=A4)
 
-    # double border
+    # faint centered watermark (drawn first, behind everything)
+    if os.path.exists(WATERMARK_PATH):
+        try:
+            wm_w = 130 * mm
+            wm_h = wm_w * 992.0 / 1403.0   # logo.png aspect ratio
+            c.drawImage(WATERMARK_PATH, cx - wm_w / 2.0, H / 2.0 - wm_h / 2.0,
+                        width=wm_w, height=wm_h, mask="auto")
+        except Exception:
+            pass
+
+    # elegant single border
     c.setStrokeColor(navy)
-    c.setLineWidth(3)
-    c.rect(12 * mm, 12 * mm, W - 24 * mm, H - 24 * mm)
-    c.setLineWidth(1)
-    c.rect(14 * mm, 14 * mm, W - 28 * mm, H - 28 * mm)
+    c.setLineWidth(2.5)
+    c.rect(10 * mm, 10 * mm, W - 20 * mm, H - 20 * mm)
 
     def para(text, size, color, leading=None, bold=False, align=TA_CENTER):
         style = ParagraphStyle(
@@ -418,7 +430,6 @@ def build_certificate_pdf(name: str) -> bytes:
         p.drawOn(c, cx - w / 2.0, top_y - h)
         return h
 
-    cx = W / 2.0
     content_w = W - 50 * mm
     y = H - 30 * mm
 
@@ -429,7 +440,7 @@ def build_certificate_pdf(name: str) -> bytes:
     y -= 16 * mm
     y -= draw_centered(para("Certificamos que", 12, gray), cx, y, content_w)
     y -= 5 * mm
-    y -= draw_centered(para((name or "Participante").strip(), 24, navy, bold=True),
+    y -= draw_centered(para((name or "Participante").strip(), 24, name_dark, bold=True),
                        cx, y, content_w)
 
     y -= 9 * mm
@@ -465,13 +476,17 @@ def build_certificate_pdf(name: str) -> bytes:
     y -= 6 * mm
     y -= draw_centered(para(f"Emitido em {_emitido_em()}", 10.5, gray), cx, y, content_w)
 
-    # seal (centered near the bottom)
+    # seal (centered near the bottom, slight stamp-like rotation)
     if os.path.exists(SEAL_PATH):
         try:
-            seal_w = 32 * mm
-            c.drawImage(SEAL_PATH, cx - seal_w / 2.0, 22 * mm,
+            seal_w = 40 * mm
+            c.saveState()
+            c.translate(cx, 42 * mm)      # seal center
+            c.rotate(-5)
+            c.drawImage(SEAL_PATH, -seal_w / 2.0, -seal_w / 2.0,
                         width=seal_w, height=seal_w,
                         mask="auto", preserveAspectRatio=True)
+            c.restoreState()
         except Exception:
             pass
 
