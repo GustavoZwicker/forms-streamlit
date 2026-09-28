@@ -624,7 +624,7 @@ def screen_demographics():
                        ["<18", "18–24", "25–34", "35–44", "45–54", "55 ou mais"], index=None)
         gender = st.radio("1.2 Com qual gênero você se identifica?",
                           ["Feminino", "Masculino", "Não-binário", "Agênero / Gênero Fluido", "Prefiro descrever de outra forma", "Prefiro não responder"], index=None)
-        ethnicity = st.radio("1.3 Com qual cor/raça/etnia você se identifica?",
+        ethnicity = st.radio("1.3 Com qual cor/etnia você se identifica?",
                              ["Branca", "Preta", "Parda", "Amarela", "Indígena",
                               "Prefiro não responder"], index=None)
         education = st.radio("1.4 Qual seu grau de escolaridade? *",
